@@ -601,6 +601,17 @@ def main():
         msg_parts.append("\n👥 Activity:")
         msg_parts.extend(activity)
 
+    # Scheduled jobs that need a human (19 Nov 2026): 3+ failures in a row, or
+    # no successful run within three expected intervals. Reported unprompted.
+    try:
+        from skills.scheduler import registry_problems
+        _problems = registry_problems()
+        if _problems:
+            msg_parts.append("\n⏱️ Scheduled jobs needing attention:")
+            msg_parts.extend(f"  • {p}" for p in _problems)
+    except Exception as _e:
+        msg_parts.append(f"\n⏱️ Could not check scheduled jobs: {_e}")
+
     msg_parts.append(f"\n📊 Active memory: {active_count} facts")
     msg_parts.append("Use memory: to correct anything.")
 

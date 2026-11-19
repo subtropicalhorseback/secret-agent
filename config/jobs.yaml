@@ -1,0 +1,100 @@
+# config/jobs.yaml — the system job registry
+#
+# Every recurring system job is declared here and run by dispatcher.py (one
+# crontab line, every minute). {WORKSPACE} and {VENV} are filled in from
+# chip_config, so this file holds no absolute paths and no household data.
+#
+# WHO MAY CHANGE WHAT
+#   - This file is edited only as a code change (a repair job the admin
+#     approves, or a developer). Chip has no tool that writes it.
+#   - Chip may switch an UNPROTECTED job on or off, or change its schedule.
+#     Those two settings are stored separately in data/job_overrides.json;
+#     the command a job runs can never be changed by a tool.
+#   - protected: true jobs cannot be switched off or rescheduled by anyone
+#     through a tool. The dispatcher also keeps its own hardcoded list.
+#
+# FIELDS
+#   name             unique key
+#   schedule         5-field cron expression
+#   command          what to run (shell)
+#   log              output file, relative to the workspace
+#   enabled          default on/off
+#   protected        see above
+#   runner           "dispatcher" (default) or "cron" (stays in the crontab;
+#                    listed here for display only)
+#   timeout_seconds  default 300
+#   env              optional extra environment variables
+#   warn_on_disable  shown to the admin before the job is switched off
+
+- name: signal_watchdog
+  schedule: "*/5 * * * *"
+  command: "{VENV}/bin/python3 {WORKSPACE}/signal_watchdog.py"
+  log: data/logs/signal_watchdog_cron.log
+  enabled: true
+  protected: true
+  runner: cron
+
+- name: vpn_guard
+  schedule: "*/5 * * * *"
+  command: "{VENV}/bin/python3 {WORKSPACE}/vpn_guard.py"
+  log: data/logs/vpn_guard_cron.log
+  enabled: true
+  protected: true
+  runner: cron
+
+- name: backup
+  schedule: "0 2 * * *"
+  command: "{WORKSPACE}/backup.sh"
+  log: data/logs/backup.log
+  enabled: true
+  protected: true
+  timeout_seconds: 3600
+
+- name: vitals
+  schedule: "*/5 * * * *"
+  command: "{VENV}/bin/python3 {WORKSPACE}/skills/vitals.py"
+  log: data/logs/vitals.log
+  enabled: true
+  protected: false
+  env: {CRON: "1"}
+  warn_on_disable: "The thermal guard stops, and system health readings go stale."
+
+- name: renice_embed
+  schedule: "*/5 * * * *"
+  command: "sudo {VENV}/bin/python3 {WORKSPACE}/renice_embed.py"
+  log: data/logs/renice_embed.log
+  enabled: true
+  protected: false
+
+- name: dream_cycle
+  schedule: "0 1 * * *"
+  command: "{VENV}/bin/python3 {WORKSPACE}/dream_cycle.py"
+  log: data/logs/dream_cycle.log
+  enabled: true
+  protected: false
+  timeout_seconds: 3600
+  warn_on_disable: "Nightly vault classification, memory maintenance and buffer archiving stop."
+
+- name: rotate_exit
+  schedule: "0 */4 * * *"
+  command: "{VENV}/bin/python3 {WORKSPACE}/skills/rotate_exit.py"
+  log: data/logs/rotate_exit.log
+  enabled: true
+  protected: false
+
+- name: apt_upgrade
+  schedule: "0 3 * * 0"
+  command: "sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=\"--force-confold\""
+  log: data/logs/apt_update.log
+  enabled: true
+  protected: false
+  timeout_seconds: 3600
+  warn_on_disable: "Security updates stop landing until this is switched back on."
+
+- name: pip_report
+  schedule: "0 4 1 * *"
+  command: "{VENV}/bin/python3 {WORKSPACE}/skills/pip_report.py"
+  log: data/logs/pip_outdated.log
+  enabled: true
+  protected: false
+  timeout_seconds: 600

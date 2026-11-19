@@ -288,9 +288,19 @@ TOOL_DEFS = [
         "name": "list_reminders",
         "description": (
             "List pending (not yet fired) reminders. Use when asked what "
-            "reminders are set or what's coming up."
+            "reminders are set or what's coming up. Call this first to get "
+            "a reminder's id before modifying or cancelling it."
         ),
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_fired": {
+                    "type": "boolean",
+                    "description": "also show already-fired and cancelled reminders",
+                },
+            },
+            "required": [],
+        },
     },
     {
         "name": "read_file",
@@ -477,6 +487,26 @@ TOOL_DEFS = [
         },
     },
     {
+        "name": "stage_fix",
+        "description": (
+            "Stage a self-repair or self-modification job for the admin to "
+            "approve. Use when an admin asks you to change your own code, "
+            "config, scheduled jobs (cron), or to make a git commit - "
+            "anything you have no direct tool for. This only STAGES the "
+            "job: nothing runs until the admin personally replies "
+            "'fix: approve' (or 'fix: reject'). You cannot approve it. "
+            "Write the description as a complete, self-contained work "
+            "order for an autonomous coding agent. Admin only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"description": {"type": "string",
+                "description": "the full work order: what to change, limits, "
+                               "and whether to commit"}},
+            "required": ["description"],
+        },
+    },
+    {
         "name": "browse_task",
         "description": (
             "Drive a real Chromium browser to complete a task on live "
@@ -501,8 +531,9 @@ TOOL_DEFS = [
             "Read the development notes Claude Code keeps about YOU (Chip): "
             "what was changed in recent upgrade sessions, your current "
             "capabilities, known issues, and architecture decisions. Call "
-            "with no filename to list available notes (start with MEMORY.md, "
-            "the index). Use whenever the admin or the partner asks what changed about "
+            "with no filename to list available notes. ALWAYS read "
+            "chip_current_state.md first: it is the current truth, and the "
+            "dated Chip_*.md reports are history that it overrides. Use whenever the admin or the partner asks what changed about "
             "you, what you can do now, why something was done, or about "
             "your own development history. Read-only; admin only."
         ),
@@ -529,13 +560,158 @@ TOOL_DEFS = [
             "required": ["filename"],
         },
     },
+
+    # ─── Self-scheduling (admin only, 19 Nov 2026) ───────────────────────────
+    # These operate on schedule metadata and reminder payloads ONLY. They do
+    # not read or write facts, history, the rolling summary, the vault, the
+    # media catalog, or recipes. Creating a job never creates a command —
+    # see skills/scheduler.py for why there is no crontab write path.
+    {
+        "name": "list_scheduled_jobs",
+        "description": (
+            "List everything that runs on a schedule: your own managed "
+            "jobs, and the system jobs (vitals, backups, nightly cycle, "
+            "updates and so on) with each one's schedule, on/off state, "
+            "last successful run and any failures. Use when asked what is "
+            "scheduled, what runs automatically, or whether something is "
+            "failing. Admin only."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "create_scheduled_job",
+        "description": (
+            "Create a recurring scheduled job that wakes you up on a "
+            "schedule to do something for a household user — e.g. a morning "
+            "weather check or a Friday summary. When it fires you receive "
+            "the note and act on it with tools, then message the user. This "
+            "schedules a RECURRING task; for a one-off use create_reminder. "
+            "It cannot run shell commands or scripts. Admin only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "short unique label, e.g. 'morning-weather'"},
+                "schedule": {"type": "string",
+                             "description": "5-field cron: minute hour day-of-month "
+                                            "month day-of-week. e.g. '0 7 * * *' "
+                                            "daily at 7am, '*/30 * * * *' every 30 "
+                                            "minutes, '0 17 * * 5' Fridays at 5pm."},
+                "target_user": {"type": "string",
+                                "description": "name of the household user this job "
+                                               "acts for and messages"},
+                "note": {"type": "string",
+                         "description": "what to do when it fires, written so a "
+                                        "future you with no memory of this "
+                                        "conversation can act on it alone"},
+            },
+            "required": ["name", "schedule", "target_user", "note"],
+        },
+    },
+    {
+        "name": "modify_scheduled_job",
+        "description": (
+            "Change an existing scheduled job's schedule, target user, or "
+            "note. Give the job id from list_scheduled_jobs plus only the "
+            "fields you are changing. Cannot modify system cron entries. "
+            "Admin only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "id from list_scheduled_jobs, e.g. 'job001'"},
+                "schedule": {"type": "string", "description": "new 5-field cron expression"},
+                "target_user": {"type": "string", "description": "new target household user"},
+                "note": {"type": "string", "description": "new instruction text"},
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "set_scheduled_job_enabled",
+        "description": (
+            "Turn a scheduled job on or off: one of your managed jobs (by "
+            "id) or an unlocked system job (by name, e.g. vitals, "
+            "dream_cycle). Disabling is reversible and keeps settings; "
+            "nothing can be deleted. Locked system jobs cannot be changed. "
+            "Admin only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "id from list_scheduled_jobs"},
+                "enabled": {"type": "boolean", "description": "true to enable, false to disable"},
+            },
+            "required": ["job_id", "enabled"],
+        },
+    },
+    {
+        "name": "modify_reminder",
+        "description": (
+            "Change a pending reminder's fire time and/or its message. Get "
+            "the reminder id from list_reminders first. Use when someone "
+            "asks to move, delay, or reword a reminder that is already set, "
+            "instead of creating a second one. Admin only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "string", "description": "id from list_reminders"},
+                "when": {"type": "string",
+                         "description": "new time in natural language, e.g. "
+                                        "'tomorrow at 9am' or 'in 3 hours'. Omit to "
+                                        "keep the current time."},
+                "message": {"type": "string",
+                            "description": "new reminder text. Omit to keep the current text."},
+            },
+            "required": ["reminder_id"],
+        },
+    },
+    {
+        "name": "cancel_reminder",
+        "description": (
+            "Cancel a pending reminder so it will not fire. Reversible — "
+            "pass restore=true to bring a cancelled reminder back. Get the "
+            "id from list_reminders. Admin only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "string", "description": "id from list_reminders"},
+                "restore": {"type": "boolean",
+                            "description": "true to un-cancel a previously cancelled reminder"},
+            },
+            "required": ["reminder_id"],
+        },
+    },
 ]
 
+# Tools hidden from non-admin users entirely. Execution is ALSO tier-checked
+# in the handlers below (same mechanism as read_file / stage_fix) — this set
+# is the belt to that suspenders: a non-admin never sees the schedule tools
+# in their tool list, so the model cannot be talked into reaching for one.
+ADMIN_ONLY_TOOLS = {
+    "list_scheduled_jobs",
+    "create_scheduled_job",
+    "modify_scheduled_job",
+    "set_scheduled_job_enabled",
+    "modify_reminder",
+    "cancel_reminder",
+}
 
-def gemini_tools():
+
+def tools_for(tier):
+    """TOOL_DEFS filtered for a user tier."""
+    if tier == "admin":
+        return TOOL_DEFS
+    return [t for t in TOOL_DEFS if t["name"] not in ADMIN_ONLY_TOOLS]
+
+
+def gemini_tools(tier="admin"):
     """Same tool definitions, reshaped for Gemini's function_declarations format."""
     decls = []
-    for t in TOOL_DEFS:
+    for t in tools_for(tier):
         decls.append({
             "name": t["name"],
             "description": t["description"],
@@ -765,16 +941,27 @@ async def _execute_tool_inner(tool_name, tool_input, *, sender, name, active_voi
                 f"• {c}  [{str(t)[:10]}]" for c, t in rows)
 
         elif tool_name == "list_reminders":
-            rpath = f"{WORKSPACE}/data/reminders.json"
-            if not os.path.exists(rpath):
+            from skills import remind as _rem
+            data = _rem.load_reminders()
+            if not data:
                 return "No reminders set."
-            data    = json.load(open(rpath))
-            pending = [r for r in data if not r.get("fired")]
-            if not pending:
+            # Admins get stable ids (needed by modify_reminder /
+            # cancel_reminder) and can opt into seeing fired/cancelled ones.
+            show_all = (tier == "admin"
+                        and bool(tool_input.get("include_fired")))
+            rows = data if show_all else [r for r in data if _rem.is_active(r)]
+            if not rows:
                 return "No pending reminders."
-            return f"Pending ({len(pending)}):\n" + "\n".join(
-                f"  {r['fire_at'][:16]}  {r['recipient_name']}  {r['message'][:60]}"
-                for r in pending)
+            out = []
+            for r in rows:
+                if r.get("fired"):      state = "[fired]     "
+                elif r.get("cancelled"): state = "[cancelled] "
+                else:                   state = ""
+                prefix = f"  [{_rem.reminder_id(r)}] " if tier == "admin" else "  "
+                out.append(f"{prefix}{r['fire_at'][:16]}  {state}"
+                           f"{r['recipient_name']}  {r['message'][:60]}")
+            label = "Reminders" if show_all else "Pending"
+            return f"{label} ({len(rows)}):\n" + "\n".join(out)
 
         elif tool_name == "read_file":
             if tier != "admin":
@@ -971,6 +1158,27 @@ async def _execute_tool_inner(tool_name, tool_input, *, sender, name, active_voi
                     f"data/documents/ and {'indexed into the vault' if ingested else 'vault indexing failed'}. "
                     f"Confirm briefly — do not repeat the document body in chat.")
 
+        elif tool_name == "stage_fix":
+            # Chip may STAGE a job; approval is a separate message typed by an
+            # admin and handled by the coordinator, never by a tool. The exact
+            # staged text is sent to the admin by this handler, so what gets
+            # approved is what was staged, not the model's paraphrase of it.
+            if tier != "admin":
+                return "Staging repair jobs is admin-only."
+            desc = str(tool_input.get("description", "")).strip()
+            if len(desc) < 20:
+                return "Describe the job fully - that description is the work order."
+            from skills import self_heal
+            from coordinator import send_signal, USERS
+            if "awaiting" in self_heal.status():
+                return ("A job is already staged and waiting. The admin must "
+                        "reply 'fix: approve' or 'fix: reject' before another.")
+            staged = self_heal.stage(desc, staged_by=USERS.get(sender, {}).get("name", "admin"))
+            await send_signal(session, f"[Chip] {staged}", recipient=sender)
+            return ("Staged, and the exact job text was just sent to the admin. "
+                    "It will NOT run until they reply 'fix: approve'. Tell them "
+                    "that briefly; do not repeat the job text.")
+
         elif tool_name == "browse_task":
             if tier != "admin":
                 return "Browsing is admin-only."
@@ -1032,8 +1240,8 @@ async def _execute_tool_inner(tool_name, tool_input, *, sender, name, active_voi
             fname = str(tool_input.get("filename", "")).strip()
             if not fname:
                 lines = ["Development notes available (read with filename). "
-                         "MEMORY.md is the index; project_state.md has the "
-                         "change history:"]
+                         "chip_current_state.md is the CURRENT truth - read it "
+                         "first. Dated reports are history:"]
                 for name_, path_ in inv:
                     ts_ = datetime.fromtimestamp(os.path.getmtime(path_))
                     lines.append(f"  {name_}  ({os.path.getsize(path_)//1024}KB, "
@@ -1066,8 +1274,250 @@ async def _execute_tool_inner(tool_name, tool_input, *, sender, name, active_voi
                 return f"Found {os.path.basename(path)} but extracted no text ({note})."
             return f"[{os.path.basename(path)} — {note}]\n{text}"
 
+        # ─── Self-scheduling (admin only) ───────────────────────────────────
+        elif tool_name in ("list_scheduled_jobs", "create_scheduled_job",
+                           "modify_scheduled_job", "set_scheduled_job_enabled",
+                           "modify_reminder", "cancel_reminder"):
+            if tier != "admin":
+                return "Schedule management is admin-only."
+            return await _handle_schedule_tool(tool_name, tool_input, sender)
+
         else:
             return f"Unknown tool: {tool_name}"
 
     except Exception as e:
         return f"Tool execution error: {e}"
+
+
+# ─── Schedule-management handlers (19 Nov 2026) ───────────────────────────────
+# Split out of the main dispatch chain purely for length. Every entry point is
+# tier-gated by the caller above. These touch schedule metadata and reminder
+# payloads only.
+
+def _resolve_user(who):
+    """Map a household name to (phone, name). Returns (None, who) if unknown."""
+    from chip_config import phone_by_name, name_by_phone
+    who = (who or "").strip()
+    if not who:
+        return None, who
+    if who.startswith("+"):
+        return who, name_by_phone(who, who)
+    phone = phone_by_name(who)
+    if phone:
+        return phone, name_by_phone(phone, who)
+    return None, who
+
+
+def _cron_label(command):
+    """Short human label for a system cron line — the script or program it
+    runs, not whatever flag happens to be last before the redirect."""
+    head = command.split(">>")[0].split("2>&1")[0].strip()
+    toks = [t for t in head.split() if not t.startswith("-")]
+    for t in reversed(toks):
+        if t.endswith((".py", ".sh")):
+            return os.path.basename(t)
+    for t in toks:
+        base = os.path.basename(t)
+        if base and base not in ("sudo", "env") and "=" not in base \
+                and not base.startswith("python"):
+            return base
+    return head[:40]
+
+
+def _fmt_next(cron):
+    from skills import scheduler
+    try:
+        nxt = scheduler.next_fire(cron)
+    except ValueError:
+        return "invalid schedule"
+    if nxt is None:
+        return "never (no matching date)"
+    return nxt.strftime("%a %b %-d %H:%M")
+
+
+def _registry_names():
+    try:
+        from skills import scheduler
+        return {j["name"] for j in scheduler.load_registry()}
+    except Exception:
+        return set()
+
+
+async def _handle_schedule_tool(tool_name, tool_input, sender):
+    from skills import scheduler
+    from skills import remind
+    from coordinator import USERS
+
+    actor = USERS.get(sender, {}).get("name", "admin")
+
+    # ── Jobs ────────────────────────────────────────────────────────────────
+    if tool_name == "list_scheduled_jobs":
+        jobs = scheduler.load_jobs()
+        lines = []
+        if jobs:
+            lines.append(f"Managed jobs ({len(jobs)}):")
+            for j in jobs:
+                state = "on " if j.get("enabled", True) else "OFF"
+                nxt = (_fmt_next(j["cron"]) if j.get("enabled", True)
+                       else "— disabled")
+                lines.append(
+                    f"  [{j['id']}] {state} {j['name']} — "
+                    f"{scheduler.describe_cron(j['cron'])} ({j['cron']}) "
+                    f"→ {j.get('target_name','?')} | next: {nxt}")
+        else:
+            lines.append("Managed jobs: none yet.")
+
+        try:
+            reg = await asyncio.to_thread(scheduler.registry_entries)
+        except Exception as e:
+            reg = []
+            lines.append(f"\nSystem jobs: registry failed to load ({e}).")
+        if reg:
+            lines.append(f"\nSystem jobs ({len(reg)}). Use the job's name as job_id "
+                         f"to switch it on/off or change its schedule; locked "
+                         f"ones cannot be changed:")
+            for r in reg:
+                state = "on " if r["enabled"] else "OFF"
+                lock  = " [locked]" if (r["protected"] or r["runner"] != "dispatcher") else ""
+                if r["runner"] != "dispatcher":
+                    status = "runs from the system crontab"
+                elif r["last_success"]:
+                    status = f"last ok {r['last_success'][5:16].replace('T', ' ')}"
+                elif r["last_run"]:
+                    status = f"last run failed (exit {r['last_exit_code']})"
+                else:
+                    status = "not run yet"
+                if r["consecutive_failures"]:
+                    status += f", {r['consecutive_failures']} failure(s) in a row"
+                lines.append(f"  {state} {r['name']:<16} {r['schedule']:<13} "
+                             f"{status}{lock}")
+            problems = await asyncio.to_thread(scheduler.registry_problems)
+            if problems:
+                lines.append("NEEDS ATTENTION: " + "; ".join(problems))
+        return "\n".join(lines)
+
+    if tool_name == "create_scheduled_job":
+        phone, tname = _resolve_user(tool_input.get("target_user"))
+        if not phone:
+            return (f"'{tool_input.get('target_user')}' isn't a known "
+                    f"household user — can't target a job at them.")
+        try:
+            job = await asyncio.to_thread(
+                scheduler.create_job,
+                str(tool_input.get("name", "")),
+                str(tool_input.get("schedule", "")),
+                phone, tname,
+                str(tool_input.get("note", "")),
+                actor)
+        except ValueError as e:
+            return f"Job not created — {e}"
+        return (f"Created [{job['id']}] {job['name']}: "
+                f"{scheduler.describe_cron(job['cron'])} for {tname}. "
+                f"Next fire {_fmt_next(job['cron'])}.")
+
+    if tool_name == "modify_scheduled_job":
+        job_id = str(tool_input.get("job_id", "")).strip()
+        if job_id in _registry_names():
+            # A system job: the schedule is the ONLY thing a tool may change.
+            if not tool_input.get("schedule"):
+                return ("For a system job only the schedule can be changed "
+                        "(its command is fixed). Give a schedule.")
+            try:
+                job = await asyncio.to_thread(
+                    scheduler.reschedule_registry_job, job_id,
+                    str(tool_input["schedule"]))
+            except ValueError as e:
+                return f"Job not modified — {e}"
+            return (f"Rescheduled system job {job['name']}: "
+                    f"{scheduler.describe_cron(job['schedule'])} ({job['schedule']}).")
+        kwargs = {}
+        if tool_input.get("schedule"):
+            kwargs["cron"] = str(tool_input["schedule"])
+        if tool_input.get("note"):
+            kwargs["note"] = str(tool_input["note"])
+        if tool_input.get("target_user"):
+            phone, tname = _resolve_user(tool_input["target_user"])
+            if not phone:
+                return (f"'{tool_input['target_user']}' isn't a known "
+                        f"household user.")
+            kwargs["target_phone"], kwargs["target_name"] = phone, tname
+        if not kwargs:
+            return "Nothing to change — give a schedule, target_user, or note."
+        try:
+            job = await asyncio.to_thread(
+                lambda: scheduler.update_job(job_id, **kwargs))
+        except ValueError as e:
+            return f"Job not modified — {e}"
+        return (f"Updated [{job['id']}] {job['name']}: "
+                f"{scheduler.describe_cron(job['cron'])} → "
+                f"{job.get('target_name','?')}. "
+                f"Next fire {_fmt_next(job['cron'])}.")
+
+    if tool_name == "set_scheduled_job_enabled":
+        job_id = str(tool_input.get("job_id", "")).strip()
+        want = bool(tool_input.get("enabled"))
+        if job_id in _registry_names():
+            try:
+                job = await asyncio.to_thread(
+                    scheduler.set_registry_enabled, job_id, want)
+            except ValueError as e:
+                return f"Job not changed — {e}"
+            if job["enabled"]:
+                return f"System job {job['name']} is ON ({job['schedule']})."
+            warn = f" Consequence: {job['warn_on_disable']}" if job.get("warn_on_disable") else ""
+            return (f"System job {job['name']} is OFF. Its settings are kept; "
+                    f"switch it back on any time.{warn} Tell the admin this consequence.")
+        try:
+            job = await asyncio.to_thread(scheduler.set_enabled, job_id, want)
+        except ValueError as e:
+            return f"Job not changed — {e}"
+        if job["enabled"]:
+            return (f"Enabled [{job['id']}] {job['name']}. "
+                    f"Next fire {_fmt_next(job['cron'])}.")
+        return (f"Disabled [{job['id']}] {job['name']} — settings kept, "
+                f"re-enable any time.")
+
+    # ── Reminders (same store as create_reminder, no parallel storage) ──────
+    if tool_name == "modify_reminder":
+        rid = str(tool_input.get("reminder_id", "")).strip()
+        target = remind.find_reminder(rid)
+        if not target:
+            return f"No reminder with id '{rid}' — run list_reminders first."
+
+        fire_at = None
+        if tool_input.get("when"):
+            tname = target.get("recipient_name", actor)
+            try:
+                parsed = await remind.parse_reminder(
+                    f"remind {tname} {tool_input['when']} about: reschedule",
+                    actor, sender)
+                fire_at = datetime.fromisoformat(parsed["event_time"])
+            except Exception as e:
+                return f"Couldn't parse that time: {e}"
+
+        message = tool_input.get("message")
+        if fire_at is None and not message:
+            return "Nothing to change — give a new time, a new message, or both."
+        try:
+            r = await asyncio.to_thread(
+                remind.update_reminder, rid, fire_at,
+                str(message) if message else None)
+        except ValueError as e:
+            return f"Reminder not modified — {e}"
+        return (f"Reminder [{r['id']}] now fires "
+                f"{datetime.fromisoformat(r['fire_at']).strftime('%a %b %-d at %-I:%M %p')} "
+                f"for {r.get('recipient_name','?')}.")
+
+    if tool_name == "cancel_reminder":
+        rid = str(tool_input.get("reminder_id", "")).strip()
+        restore = bool(tool_input.get("restore"))
+        try:
+            r = await asyncio.to_thread(remind.set_cancelled, rid, not restore)
+        except ValueError as e:
+            return f"Reminder not changed — {e}"
+        when = datetime.fromisoformat(r["fire_at"]).strftime("%a %b %-d at %-I:%M %p")
+        if restore:
+            return f"Restored reminder [{r['id']}] — fires {when}."
+        return f"Cancelled reminder [{r['id']}] (was {when}). Reversible."
+
+    return f"Unknown schedule tool: {tool_name}"

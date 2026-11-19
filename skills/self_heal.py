@@ -44,6 +44,9 @@ import sys as _sys
 _sys.path.insert(0, WORKSPACE)
 from chip_config import ADMIN_PHONE
 TIMEOUT_SECS  = 1800
+# Pinned explicitly: the CLI's saved default can be an alias a headless run
+# cannot resolve (a job failed that way on 19 Nov 2026).
+HEAL_MODEL    = os.getenv("CHIP_HEAL_MODEL", "claude-opus-5")
 
 CLAUDE_BIN = (shutil.which("claude")
               or os.path.expanduser("~/.npm-global/bin/claude"))
@@ -56,6 +59,10 @@ Rules:
 - If you changed coordinator.py or skills/, finish with: sudo systemctl restart chip.service
   and confirm `systemctl is-active chip` says active.
 - If the fix is unsafe or unclear, STOP and say so rather than guessing.
+- Git: if the job asks for a commit, commit LOCALLY only. Never push, never add or
+  change a remote, never rewrite history. Report the commit hash.
+- Keep household data out of code: names, numbers, places and vocabulary belong in
+  the gitignored files under config/, read through chip_config.
 - End with a 3-6 line plain-text summary of what you changed and how you verified it."""
 
 
@@ -132,15 +139,22 @@ def status():
 def approve():
     if not os.path.exists(PENDING_FILE):
         return "Nothing staged — use fix: <description> first."
-    # Detached (new session): survives the coordinator restarting under it,
-    # which a successful heal of coordinator.py will do.
-    subprocess.Popen(
-        [f"{WORKSPACE}/venv/bin/python3", f"{WORKSPACE}/skills/self_heal.py", "--run"],
-        cwd=WORKSPACE, start_new_session=True,
-        stdout=open(f"{HEAL_LOG_DIR}/heal_launcher.log", "a"),
-        stderr=subprocess.STDOUT,
-    )
-    return ("Healer launched (detached — it survives a service restart). "
+    # Launched as its own transient systemd unit. A plain detached child stays
+    # inside chip.service's control group, and systemd kills the whole group
+    # on restart - which is exactly how a healer died mid-job on 19 Nov 2026,
+    # the moment it restarted the service it had just repaired.
+    unit = f"chip-heal-{datetime.now():%Y%m%d-%H%M%S}"
+    r = subprocess.run(
+        ["sudo", "-n", "systemd-run", f"--unit={unit}", "--collect",
+         "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+         f"--working-directory={WORKSPACE}",
+         f"--setenv=HOME={os.path.expanduser('~')}",
+         f"--setenv=CHIP_WORKSPACE={WORKSPACE}",
+         f"{WORKSPACE}/venv/bin/python3", f"{WORKSPACE}/skills/self_heal.py", "--run"],
+        capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return f"Healer failed to launch: {(r.stderr or r.stdout).strip()[:300]}"
+    return ("Healer launched in its own unit, so it survives a restart of Chip. "
             "Progress and the result will arrive here. Typical run: 2-10 min.")
 
 
@@ -160,31 +174,33 @@ def run_job():
               f"{spec['description']}\n\n"
               f"RECENT coordinator.log TAIL:\n{spec['log_tail']}")
 
-    _signal_send(f"🔧 Healer running: «{spec['description'][:120]}»")
+    _signal_send(f"🔧 Healer running:\n{spec['description'][:3000]}")
 
     env = dict(os.environ)
     env["PATH"] = (os.path.expanduser("~/.npm-global/bin") + ":/usr/local/bin:/usr/bin:/bin:"
                    + env.get("PATH", ""))
     env.setdefault("HOME", os.path.expanduser("~"))
 
+    header = (f"JOB: {spec['description']}\nSTAGED: {spec['staged_at']}\n"
+              f"STARTED: {datetime.now().isoformat()}\n\n")
+    open(log_path, "w").write(header)
     try:
-        result = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"],
-            cwd=WORKSPACE, env=env, timeout=TIMEOUT_SECS,
-            capture_output=True, text=True)
-        output = (result.stdout or "") + ("\n--- stderr ---\n" + result.stderr
-                                          if result.stderr else "")
+        # Output goes straight to the log file, so a killed or timed-out run
+        # still leaves everything it printed on disk.
+        with open(log_path, "a") as lf:
+            result = subprocess.run(
+                [CLAUDE_BIN, "-p", prompt, "--model", HEAL_MODEL,
+                 "--dangerously-skip-permissions"],
+                cwd=WORKSPACE, env=env, timeout=TIMEOUT_SECS,
+                stdout=lf, stderr=subprocess.STDOUT, text=True)
         verdict = "✅ Healer finished" if result.returncode == 0 else \
                   f"⚠️ Healer exited {result.returncode}"
-    except subprocess.TimeoutExpired as e:
-        output  = (e.stdout or "") if isinstance(e.stdout, str) else ""
+    except subprocess.TimeoutExpired:
         verdict = f"⏱️ Healer timed out after {TIMEOUT_SECS//60} min"
     except Exception as e:
-        output, verdict = str(e), "❌ Healer failed to run"
-
-    open(log_path, "w").write(
-        f"JOB: {spec['description']}\nSTAGED: {spec['staged_at']}\n"
-        f"VERDICT: {verdict}\n\n{output}")
+        verdict = f"❌ Healer failed to run: {e}"
+    output = open(log_path).read()[len(header):]
+    open(log_path, "a").write(f"\n\nVERDICT: {verdict}\n")
 
     # Service state is the ground truth after any heal.
     try:
@@ -193,8 +209,11 @@ def run_job():
     except Exception:
         svc = "unknown"
 
-    tail = output.strip()[-1100:] if output.strip() else "(no output)"
-    _signal_send(f"{verdict} — chip.service: {svc}\n\n…{tail}\n\n"
+    body = output.strip() or "(no output)"
+    if len(body) > 3200:                 # keep whole lines, never cut mid-sentence
+        cut = body[-3200:]
+        body = "[earlier output is in the log]\n" + cut[cut.find("\n") + 1:]
+    _signal_send(f"{verdict} — chip.service: {svc}\n\n{body}\n\n"
                  f"Full log: cat: {os.path.basename(log_path)} "
                  f"(data/patches/)")
     return 0

@@ -132,6 +132,11 @@ TAGS = {
 
 RAG_THRESHOLD = 0.55
 
+# Sent when a model returns no text at all (refusal, exhausted budget) so the
+# user never just gets "..." with no explanation.
+EMPTY_REPLY = ("I didn't get a usable answer back from the model on that one "
+               "(it returned nothing). Send it again, or rephrase and I'll retry.")
+
 # ─── Users & Permissions ──────────────────────────────────────────────────────
 
 # All identity data lives in config/users.json via chip_config (19 Nov 2026) —
@@ -342,6 +347,20 @@ Self-repair (admin):
   fix: approve | reject | status
   Runs detached with full repo access; results arrive here. Nothing
   executes without the explicit approve.
+
+Scheduling (admin) — the line is ownership, not topic:
+  Just ask in plain language ("check the trough every morning at six",
+  "what runs automatically on this box").
+  Chip's own jobs   it can list, create, retime, and switch off. A job
+                    carries a note it acts on when it fires — never a
+                    shell command — so firing one only wakes Chip up.
+                    Off is a reversible flag; jobs are never deleted.
+  System cron       read-only. Chip can tell you every entry and when it
+                    next runs, and cannot add, edit, or remove any of
+                    them. Those stay a crontab -e job for you.
+  So "can you turn off that heartbeat" depends on who created it, not on
+  what it does. Ask Chip to list the schedule and it will say which side
+  of the line each one sits on.
 
 Analysis pipelines:
   analyze: <entity>
@@ -733,7 +752,8 @@ def load_context_blocks(sender, sections=None, rag_context=None, rag_facts=None,
         # Per-sender stable block, so this stays cache-friendly.
         stable += ("\n\nSELF-KNOWLEDGE: Your own development history, recent "
                    "upgrades, and current capability notes are readable via "
-                   "the read_session_notes tool (MEMORY.md is the index). "
+                   "the read_session_notes tool (read chip_current_state.md "
+                   "first; it overrides the older dated reports). "
                    "Consult it before answering questions about what changed "
                    "about you, what you can do, or why you work the way you do "
                    "— don't guess from training data.")
@@ -1282,6 +1302,12 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                     sections=None, length="default", fallback=False):
     model_name = MODELS.get(tier, MODELS["cloud_default"])
     tag        = _model_tag(model_name, fallback=fallback)
+    # `tier` above is the ROUTING tier (cloud_default/cloud_heavy). The
+    # user's permission tier is separate, and decides which tools are even
+    # visible — admin-only tools are withheld from non-admins' tool list
+    # entirely, on top of the per-tool check inside execute_tool().
+    user_tier  = USERS.get(sender, {}).get("tier", "user")
+    user_tools = tool_calling.tools_for(user_tier)
     _stable, _semi, _volatile = load_context_blocks(
         sender, sections=sections, rag_context=rag_context,
         rag_facts=rag_facts, length=length)
@@ -1320,7 +1346,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                 for round_i in range(TOOL_ROUND_CAP):
                     payload = {"contents": contents,
                                "systemInstruction": sys_instruction,
-                               "tools": tool_calling.gemini_tools()}
+                               "tools": tool_calling.gemini_tools(user_tier)}
                     async with session.post(
                         url, json=payload,
                         timeout=aiohttp.ClientTimeout(total=60),
@@ -1387,7 +1413,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                     payload = {
                         "contents": contents,
                         "systemInstruction": sys_instruction,
-                        "tools": tool_calling.gemini_tools(),
+                        "tools": tool_calling.gemini_tools(user_tier),
                         "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
                     }
                     async with session.post(
@@ -1413,7 +1439,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                     )
 
                 # usage is logged per-round inside call_logger.log_model_call()
-                return final_text or "...", tag
+                return final_text or EMPTY_REPLY, tag
 
             elif "claude" in model_name:
                 effort = get_effort(sender)
@@ -1429,7 +1455,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                     # do not re-log here or spend double-counts (H5 funnel).
                     resp = await asyncio.to_thread(
                         _claude_sync_raw, messages, system_blocks, model_name,
-                        tool_calling.TOOL_DEFS, effort,
+                        user_tools, effort,
                     )
                     total_in  += resp.usage.input_tokens
                     total_out += resp.usage.output_tokens
@@ -1484,7 +1510,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                     # usage logged inside skills.llm — no re-log here
                     resp = await asyncio.to_thread(
                         _claude_sync_raw, messages, system_blocks, model_name,
-                        tool_calling.TOOL_DEFS, effort,
+                        user_tools, effort,
                     )
                     total_in  += resp.usage.input_tokens
                     total_out += resp.usage.output_tokens
@@ -1498,7 +1524,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
                           f"thinking_tokens={_tt}, "
                           f"stop_reason={resp.stop_reason}")
 
-                return final_text or "...", tag
+                return final_text or EMPTY_REPLY, tag
 
         except Exception as e:
             print(f"⚠️ Cloud error attempt {attempt+1}: {e}")
@@ -1510,8 +1536,75 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
     return "Cloud API unavailable.", tag
 
 
+# Largest single Signal message Chip sends before splitting. 2,800 is the
+# longest message confirmed to arrive whole on the admin handset (a healer
+# result pasted back intact, 19 Nov 2026). Raise only after confirming a
+# longer one on a phone: past the client limit a failure is silent.
+SIGNAL_MAX_CHARS   = 2800
+SIGNAL_ATTACH_OVER = 2 * SIGNAL_MAX_CHARS    # longer than two messages -> file
+SIGNAL_MIN_TAIL    = 200                     # never send a runt final chunk
+
+_send_locks = {}
+
+
+def _recipient_lock(target):
+    """One asyncio.Lock per recipient. Three workers plus the reminder
+    checker share the queue, so without this two turns to the same person
+    could interleave their messages."""
+    lock = _send_locks.get(target)
+    if lock is None:
+        lock = _send_locks[target] = asyncio.Lock()
+    return lock
+
+
+def split_for_signal(text, max_chars=None, min_tail=None):
+    """Split `text` into the fewest balanced chunks that each fit one Signal
+    message, breaking at a paragraph, then a line, then a sentence, then a
+    space - never mid-word. The caller numbers chunks from len(result), so
+    the "(i/n)" marker can never disagree with what was sent."""
+    max_chars = max_chars or SIGNAL_MAX_CHARS
+    min_tail  = SIGNAL_MIN_TAIL if min_tail is None else min_tail
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+    budget = max_chars - 10                      # room for the " (i/n)" marker
+    n      = -(-len(text) // budget)
+    chunks, rest = [], text
+    while len(rest) > budget:
+        parts_left = max(n - len(chunks), 2)
+        target = min(budget, max(-(-len(rest) // parts_left), min_tail))
+        lo     = max(int(target * 0.6), 1)
+        cut    = -1
+        for sep in ("\n\n", "\n", ". ", "? ", "! ", " "):
+            # nearest break to the balanced target, searching back then forward
+            back = rest.rfind(sep, lo, target + len(sep))
+            fwd  = rest.find(sep, target, budget)
+            cand = [c for c in (back, fwd) if c != -1]
+            if cand:
+                cut = min(cand, key=lambda c: abs(c - target))
+                cut += len(sep) if sep.strip() else 0   # keep punctuation with its sentence
+                break
+        if cut <= 0:
+            cut = budget                          # one unbroken token longer than a message
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        if chunks and len(rest) < min_tail and len(chunks[-1]) + len(rest) + 2 <= budget:
+            chunks[-1] = chunks[-1] + "\n\n" + rest      # fold a runt into its neighbour
+        else:
+            chunks.append(rest)
+    return chunks
+
+
 async def send_signal(session, text, recipient=None):
+    """Send one message, serialized per recipient (see _recipient_lock)."""
     target = recipient or SENDER
+    async with _recipient_lock(target):
+        await _send_signal_raw(session, text, target)
+
+
+async def _send_signal_raw(session, text, target):
+    """The actual send. Callers must hold the recipient's lock."""
     # If this user's last inbound came over Discord, reply there instead
     # (connector scaffold, 19 Nov 2026 — no-ops until the relay is set up).
     try:
@@ -1605,47 +1698,36 @@ async def send_signal_file(session, filepath, caption, recipient=None):
 
 async def deliver_response(session, text, sender, tag=None,
                             force_file=False, cc_sender=None):
+    """Deliver one reply as ONE decision: a single message when it fits, the
+    fewest balanced chunks when it does not, a file when it is longer than
+    two messages. The recipient's lock is held across the whole delivery so
+    another turn's messages cannot land in the middle of this one."""
     text       = strip_markdown(text)
     tag_prefix = f"{tag} " if tag else ""
     full_text  = f"{tag_prefix}{text}"
+    cc         = cc_sender if (cc_sender and cc_sender != sender) else None
 
-    # Mid-length responses go out as chunked inline messages instead of a
-    # .txt attachment — attachments are the worst reading experience on a
-    # phone (19 Nov 2026). Genuinely long reports still attach.
-    if not force_file and 1200 < len(full_text) <= 4800:
-        remaining, n, total = full_text, 0, -(-len(full_text) // 1500)
-        while remaining:
-            n += 1
-            if len(remaining) <= 1500:
-                chunk, remaining = remaining, ""
-            else:
-                split = remaining.rfind("\n", 0, 1500)
-                if split < 500:
-                    split = remaining.rfind(" ", 0, 1500)
-                if split < 500:
-                    split = 1500
-                chunk, remaining = remaining[:split], remaining[split:].lstrip("\n ")
-            marker = f" ({n}/{total})" if total > 1 else ""
-            await send_signal(session, chunk + marker, recipient=sender)
-        if cc_sender and cc_sender != sender:
-            await send_signal(session, f"Sent:\n{full_text[:1400]}", recipient=cc_sender)
-        return
-
-    if force_file or len(full_text) > 1200:
+    if force_file or len(full_text) > SIGNAL_ATTACH_OVER:
         os.makedirs(REPORT_DIR, exist_ok=True)
         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
         name     = USERS.get(sender, {}).get("name", "user").lower()
         filepath = f"{REPORT_DIR}/{ts}_{name}.txt"
         with open(filepath, "w") as f:
             f.write(full_text)
-        await send_signal_file(session, filepath, f"{tag_prefix}Report attached", sender)
-        if cc_sender and cc_sender != sender:
-            await send_signal_file(session, filepath,
-                f"Copy of what was sent:", cc_sender)
-    else:
-        await send_signal(session, full_text, recipient=sender)
-        if cc_sender and cc_sender != sender:
-            await send_signal(session, f"Sent:\n{full_text}", recipient=cc_sender)
+        async with _recipient_lock(sender):
+            await send_signal_file(session, filepath, f"{tag_prefix}Report attached", sender)
+        if cc:
+            await send_signal_file(session, filepath, "Copy of what was sent:", cc)
+        return
+
+    chunks = split_for_signal(full_text)
+    total  = len(chunks)
+    async with _recipient_lock(sender):
+        for i, chunk in enumerate(chunks, 1):
+            marker = f" ({i}/{total})" if total > 1 else ""
+            await _send_signal_raw(session, chunk + marker, sender)
+    if cc:
+        await send_signal(session, f"Sent:\n{full_text[:SIGNAL_MAX_CHARS - 10]}", recipient=cc)
 
 # ─── Command parser ───────────────────────────────────────────────────────────
 
@@ -3560,7 +3642,10 @@ async def worker(session):
                     elif bn == "fix":
                         from skills import self_heal
                         _arg = (payload or "").strip()
-                        if _arg.lower() == "approve":
+                        if _arg.lower() == "approve" and packet.get("internal"):
+                            _resp = ("Approval has to be typed by an admin - a "
+                                     "scheduled follow-up cannot approve a job.")
+                        elif _arg.lower() == "approve":
                             _resp = self_heal.approve()
                         elif _arg.lower() == "reject":
                             _resp = self_heal.reject()
@@ -3703,14 +3788,15 @@ async def worker(session):
                         asyncio.create_task(
                             asyncio.to_thread(_hist.maybe_summarize, _tax_name))
 
-            expired = decrement_voice(sender)
-            if expired:
-                await send_signal(session,
-                    f"{TAGS['chip']} Voice reset to default.", recipient=sender)
+            # End-of-turn notices go out as one message, not one each.
+            _notices = []
+            if decrement_voice(sender):
+                _notices.append("Voice reset to default.")
             if decrement_effort(sender):
-                await send_signal(session,
-                    f"{TAGS['chip']} Thinking effort back to {DEFAULT_EFFORT}.",
-                    recipient=sender)
+                _notices.append(f"Thinking effort back to {DEFAULT_EFFORT}.")
+            if _notices:
+                await send_signal(session, f"{TAGS['chip']} " + " ".join(_notices),
+                                  recipient=sender)
             if _reacted:
                 await send_reaction(sender, ts, "✅")
 
@@ -3872,6 +3958,7 @@ async def reminder_checker(session):
             now = datetime.now()
             due = [r for r in load_reminders()
                    if not r.get("fired")
+                   and not r.get("cancelled")
                    and now >= datetime.fromisoformat(r["fire_at"])]
             for r in due:
                 if r.get("type") == "followup":
@@ -3881,6 +3968,7 @@ async def reminder_checker(session):
                     # parroting a canned reminder line.
                     await message_queue.put({
                         "sender": r["recipient_phone"],
+                        "internal": True,
                         "text": ("[Scheduled follow-up — you set this for "
                                  "yourself. Act on the note, using tools if "
                                  "helpful, then message the user naturally. "
@@ -3905,10 +3993,31 @@ async def reminder_checker(session):
                                 in fired_keys):
                             r["fired"] = True
                     return [r for r in rs
-                            if not r.get("fired") or r["fire_at"] > cutoff]
+                            if not (r.get("fired") or r.get("cancelled"))
+                            or r["fire_at"] > cutoff]
                 modify_reminders(_mark)
         except Exception as e:
             print(f"⚠️ Reminder checker error: {e}")
+
+        # Managed recurring jobs (19 Nov 2026) ride the same 60s beat.
+        # A job never runs a command — it re-enters the worker loop as an
+        # internal message, exactly like a follow-up reminder. Isolated in
+        # its own try so a scheduler fault can never take reminders down.
+        try:
+            from skills import scheduler
+            for job in scheduler.due_and_advance(now=datetime.now()):
+                await message_queue.put({
+                    "sender": job["target_phone"],
+                    "internal": True,
+                    "text": ("[Scheduled job — a recurring task you were set "
+                             "up to run. Act on the note, using tools if "
+                             "helpful, then message the user naturally. "
+                             f"Note: {job['note']}]"),
+                    "ts": str(int(datetime.now().timestamp() * 1000)),
+                })
+                print(f"🗓️  Job fired → {job['target_name']}: {job['name']}")
+        except Exception as e:
+            print(f"⚠️ Scheduled job checker error: {e}")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 

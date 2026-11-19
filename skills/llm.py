@@ -61,6 +61,7 @@ FABLE  = "claude-fable-5"
 SONNET = "claude-sonnet-5"
 GFLASH = "gemini-3.5-flash"
 GLITE  = "gemini-3.5-flash-lite"
+REFUSAL_FALLBACK = SONNET
 
 DEFAULT_EFFORT = "high"    # house default per the admin, 19 Nov 2026
 FABLE_EFFORT   = "xhigh"   # Fable always runs hotter
@@ -132,6 +133,18 @@ def claude_raw_sync(messages, system=None, model=OPUS, effort=None,
             stop_reason="max_tokens_empty_retry", tools=[])
         kw["max_tokens"] = max_tokens * 2
         resp = _call()
+
+    # A safety-classifier decline (stop_reason "refusal") returns HTTP 200 with
+    # no text. Unhandled, the chat path delivered a bare "..." to the user
+    # (19 Nov 2026). Retry once on the fallback model before giving up.
+    if resp.stop_reason == "refusal" and model != REFUSAL_FALLBACK:
+        call_logger.log_model_call(
+            model=model, thinking=True,
+            tokens_in=resp.usage.input_tokens, tokens_out=resp.usage.output_tokens,
+            stop_reason="refusal_fallback", tools=[])
+        return claude_raw_sync(messages, system=system, model=REFUSAL_FALLBACK,
+                               effort=effort if effort != "xhigh" else "high",
+                               max_tokens=max_tokens, tools=tools, advisor=False)
 
     tool_names = [b.name for b in resp.content if b.type in ("tool_use", "server_tool_use")]
     call_logger.log_model_call(

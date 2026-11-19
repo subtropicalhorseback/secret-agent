@@ -120,7 +120,80 @@ def add_reminder(fire_at, recipient_phone, recipient_name, sender_name, message,
         entry["type"] = rtype
     if context:
         entry["context"] = context
+    entry["id"] = reminder_id(entry)
     modify_reminders(lambda rs: rs.append(entry))
+
+
+# ─── Stable ids + reversible cancel (19 Nov 2026) ─────────────────────────────
+# The admin schedule tools need to name one specific reminder. Entries written
+# before this change have no "id", so derive one deterministically from the
+# fields that identify it; the derived value is stamped onto the entry the
+# first time it is edited, which keeps it stable afterwards even if the time
+# or message changes.
+
+def reminder_id(r):
+    import hashlib
+    if r.get("id"):
+        return r["id"]
+    seed = f"{r.get('fire_at','')}|{r.get('recipient_phone','')}|{r.get('message','')}"
+    return "rem" + hashlib.sha1(seed.encode()).hexdigest()[:6]
+
+
+def is_active(r):
+    """Pending = not yet fired and not cancelled."""
+    return not r.get("fired") and not r.get("cancelled")
+
+
+def find_reminder(rid):
+    rid = (rid or "").strip().lower()
+    for r in load_reminders():
+        if reminder_id(r).lower() == rid:
+            return r
+    return None
+
+
+def _edit_reminder(rid, apply_fn):
+    """Locate by id under one lock, stamp the id, apply apply_fn(entry)."""
+    rid = (rid or "").strip().lower()
+    result = {}
+
+    def _m(rs):
+        for r in rs:
+            if reminder_id(r).lower() != rid:
+                continue
+            r["id"] = reminder_id(r)      # freeze before mutating the seed
+            apply_fn(r)
+            result.update(r)
+            return rs
+        raise ValueError(f"no reminder with id '{rid}'")
+
+    modify_reminders(_m)
+    return result
+
+
+def update_reminder(rid, fire_at=None, message=None):
+    """Change a pending reminder's time and/or message."""
+    if fire_at is not None and fire_at <= datetime.now():
+        raise ValueError("that time is in the past")
+
+    def _apply(r):
+        if r.get("fired"):
+            raise ValueError("that reminder has already fired")
+        if fire_at is not None:
+            r["fire_at"] = fire_at.isoformat()
+        if message is not None and message.strip():
+            r["message"] = message.strip()
+            if r.get("type") == "followup":
+                r["context"] = message.strip()
+
+    return _edit_reminder(rid, _apply)
+
+
+def set_cancelled(rid, cancelled=True):
+    """Reversible flag — the checker skips cancelled entries. Not a delete."""
+    def _apply(r):
+        r["cancelled"] = bool(cancelled)
+    return _edit_reminder(rid, _apply)
 
 # ─── Claude parser ────────────────────────────────────────────────────────────
 
