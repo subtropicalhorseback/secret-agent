@@ -1,0 +1,34 @@
+{
+  "bot_number": "+15550100000",
+  "home_location": "Springfield,IL",
+  "household_blurb": "The Example household. Describe your place and operating philosophy here.",
+  "users": {
+    "+15550100001": {
+      "name": "Alex",
+      "tier": "admin",
+      "history": 30,
+      "default_model": "cloud_heavy",
+      "persona": "Alex: admin. Describe tone/persona for this user.",
+      "profile_focus": "Capture who Alex is: role, projects, recent decisions."
+    },
+    "+15550100002": {
+      "name": "Blake",
+      "tier": "admin",
+      "history": 30,
+      "default_model": "cloud_default",
+      "media_catalog": true,
+      "persona": "Blake: admin, co-owner. Describe tone/persona.",
+      "profile_focus": "Capture who Blake is."
+    },
+    "+15550100003": {
+      "name": "Casey",
+      "tier": "user",
+      "history": 10,
+      "default_model": "cloud_basic",
+      "child": true,
+      "persona": "Casey: child user. Warm, patient, age-appropriate only.",
+      "profile_focus": "Capture who Casey is. Keep age-appropriate."
+    }
+  },
+  "house_motto": ""
+}

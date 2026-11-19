@@ -1,0 +1,46 @@
+# ─── Secrets & identity (NEVER commit) ────────────────────────────────────────
+.env
+config/users.json
+config/identities/
+config/context/
+*.pem
+*.key
+
+# ─── Runtime data (personal content) ─────────────────────────────────────────
+data/
+backups/
+syncthing/
+agents/
+docker/
+models/
+database/
+coordinator.log
+*.log
+
+# ─── Python / tooling ────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+.claude/
+
+# ─── Local-only artifacts ────────────────────────────────────────────────────
+*.bak*
+*.pre_lock
+coordinator20260712.py
+masterconfig.py
+facts.md
+CLAUDE.md
+claude_resume.txt
+Chip_*.md
+Chip_*.txt
+2026*.py
+patch_wc_bracket.py
+skills/*patch*.py
+skills/dream_cycle_OLD.py
+world_cup_heartbeat.py
+skills/world_cup.py
+WC_SKILL_FIX.md
+
+# Household-specific router vocabulary (exemplar ships as routing_constants.example.py)
+config/routing_constants.py
+config/domains.py
