@@ -2160,7 +2160,33 @@ def _extract_pdf_created_at(path):
         pass
     return None
 
-async def process_pdf_upload(session, sender, save_path, raw_filename, domain="unclassified"):
+async def process_pdf_upload(session, sender, save_path, raw_filename,
+                             domain="unclassified", info=None):
+    """Ingest an uploaded PDF.
+
+    `save_path` is a temporary ".part" file. It is moved to its final name in
+    the synced folder only AFTER extraction and vault ingest, with its hash
+    recorded, so pdf_watcher never sees a half-processed upload. Before 19 Nov
+    2026 the watcher renamed the file mid-processing: the coordinator then
+    ingested a second copy under a name that no longer existed on disk, and
+    every later attempt to read the file by that name failed.
+
+    `info`, if given, receives the final filename, path and extracted text.
+    """
+    _dir = os.path.dirname(save_path)
+
+    def _publish(name):
+        target = os.path.join(_dir, name)
+        if os.path.exists(target) and os.path.abspath(target) != os.path.abspath(save_path):
+            stem, ext = os.path.splitext(name)
+            target = os.path.join(_dir, f"{stem}-{datetime.now():%H%M%S}{ext}")
+        try:
+            os.replace(save_path, target)
+        except Exception as e:
+            print(f"⚠️ PDF publish failed: {e}")
+            return save_path
+        return target
+
     try:
         import pdfplumber
         pdf_text   = ""
@@ -2173,10 +2199,13 @@ async def process_pdf_upload(session, sender, save_path, raw_filename, domain="u
                     if i == 0:
                         first_page = extracted
     except Exception as e:
-        return f"PDF saved — extraction failed: {e}"
+        _publish(raw_filename)
+        return f"PDF saved as {raw_filename} — extraction failed: {e}"
 
     if not pdf_text.strip():
-        return f"PDF saved — no extractable text: {raw_filename}"
+        _publish(raw_filename)
+        return (f"PDF saved as {raw_filename}, but it has no extractable text "
+                f"(probably a scan), so I can't read it yet.")
 
     # Extract PDF creation date from metadata
     doc_created_at = _extract_pdf_created_at(save_path)
@@ -2246,19 +2275,31 @@ async def process_pdf_upload(session, sender, save_path, raw_filename, domain="u
         except Exception:
             summary = ""
 
-    new_path = os.path.join(os.path.dirname(save_path), new_filename)
-    if new_filename != raw_filename:
-        try:
-            os.rename(save_path, new_path)
-        except Exception:
-            new_path     = save_path
-            new_filename = raw_filename
+    # Name clash with a different file already on disk: keep both.
+    if os.path.exists(os.path.join(_dir, new_filename)):
+        _stem, _ext = os.path.splitext(new_filename)
+        new_filename = f"{_stem}-{datetime.now():%H%M%S}{_ext}"
 
     try:
         from skills.vault_ingest import ingest_text
         chunks = ingest_text(pdf_text, new_filename, domain=domain, source_type="signal")
     except Exception as e:
+        _publish(new_filename)
         return f"Saved as {new_filename} but ingest failed: {e}"
+
+    # Record the file hash so pdf_watcher recognises this document as already
+    # ingested, THEN move the file into place under its final name.
+    try:
+        import hashlib
+        _h = hashlib.sha256(open(save_path, "rb").read()).hexdigest()[:16]
+        conn = sqlite3.connect(VAULT_DB)
+        conn.execute("UPDATE documents SET file_hash=? WHERE filename=?", (_h, new_filename))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"⚠️ PDF hash record: {e}")
+    new_path = _publish(new_filename)
+    if isinstance(info, dict):
+        info.update(filename=new_filename, path=new_path, text=pdf_text, chunks=chunks)
 
     # Store doc_created_at in documents table
     if doc_created_at:
@@ -2278,8 +2319,10 @@ async def process_pdf_upload(session, sender, save_path, raw_filename, domain="u
             _backup_context_db()
             conn = sqlite3.connect(CONTEXT_DB)
             conn.execute(
-                "INSERT INTO facts (content, confirmed, created_at) VALUES (?, 1, ?)",
-                (f"Document '{new_filename}': {summary}", datetime.now().isoformat())
+                "INSERT INTO facts (content, confirmed, created_at, user) "
+                "VALUES (?, 1, ?, ?)",
+                (f"Document '{new_filename}': {summary}", datetime.now().isoformat(),
+                 USERS.get(sender, {}).get("name", chip_config.ADMIN_NAME).lower())
             )
             conn.commit()
             conn.close()
@@ -2866,6 +2909,8 @@ async def media_dispatch_batch(session, sender, text, attachments, ts):
                 other_results.append(f"Attachment not found: {att_id}")
                 continue
             raw_bytes = open(att_file, "rb").read()
+            if content_type == "application/pdf":
+                save_path += ".part"        # hidden from pdf_watcher until processed
             open(save_path, "wb").write(raw_bytes)
             print(f"📁 Saved: {save_path}")
         except Exception as e:
@@ -2974,6 +3019,7 @@ async def media_dispatch(session, sender, text, attachment, ts):
     clean_text = raw_text_rest
     if domain_match:
         clean_text = domain_match.group(2).strip()
+    caption = clean_text          # what the user actually typed, before any default prompt
 
     # Richer default prompt so follow-on questions have good context
     if not clean_text:
@@ -2995,6 +3041,8 @@ async def media_dispatch(session, sender, text, attachment, ts):
 
         att_file = f"{SIGNAL_CONFIG_DIR}/attachments/{att_id}"
         raw_bytes = open(att_file, "rb").read()
+        if content_type == "application/pdf":
+            save_path += ".part"            # hidden from pdf_watcher until processed
         open(save_path, "wb").write(raw_bytes)
         print(f"📁 Saved: {save_path}")
 
@@ -3038,9 +3086,28 @@ async def media_dispatch(session, sender, text, attachment, ts):
             return
 
         if content_type == "application/pdf":
-            answer = await process_pdf_upload(session, sender, save_path, filename, domain=pdf_domain)
+            _info  = {}
+            answer = await process_pdf_upload(session, sender, save_path, filename,
+                                              domain=pdf_domain, info=_info)
+            _fname = _info.get("filename", filename)
+            if caption and _info.get("text"):
+                # The caption is an instruction about this document ("add this
+                # to recipes", "how does it look?"). Give the chat model the
+                # document text and its tools so it can act on it, instead of
+                # replying with a bare ingest receipt.
+                _doc = _info["text"]
+                _cut = "" if len(_doc) <= 60000 else "\n[document truncated at 60,000 characters]"
+                _prompt = (f"{caption}\n\n[The user attached a PDF with this message. It is "
+                           f"saved and indexed as {_fname}. Its full text follows.]\n\n"
+                           f"{_doc[:60000]}{_cut}")
+                reply, rtag = await ask_cloud(
+                    session, _prompt, sender, tier=media_tier,
+                    history=load_history(sender, USERS.get(sender, {}).get("history", 30)))
+                await deliver_response(session, f"(Saved as {_fname})\n\n{reply}", sender, tag=rtag)
+                log_to_buffer(sender, f"[pdf {_fname}] {caption}", reply)
+                return
             await deliver_response(session, answer, sender, tag=TAGS["chip"])
-            log_to_buffer(sender, f"[pdf] {filename}", answer)
+            log_to_buffer(sender, f"[pdf {_fname}] {caption}".strip(), answer)
             return
 
         if content_type.startswith("audio/"):

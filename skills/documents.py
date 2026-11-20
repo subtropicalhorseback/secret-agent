@@ -238,6 +238,41 @@ def find_readable(filename):
     want = os.path.basename((filename or "").strip())
     if not want:
         return None
+    exact = _find_exact(want)
+    if exact:
+        return exact
+    # Tolerant fallback: files get date-prefixed and re-punctuated when they
+    # are filed, so "1795131305686_0182.pdf" may now be
+    # "20261031_1795131305686-0182.pdf". Compare on letters and digits only,
+    # ignoring a leading date, and accept a unique containment match.
+    import re as _re
+
+    def _key(n):
+        stem = os.path.splitext(n)[0].lower()
+        stem = _re.sub(r"^\d{8}[_-]", "", stem)
+        return _re.sub(r"[^a-z0-9]", "", stem)
+    wk = _key(want)
+    if len(wk) < 4:
+        return None
+    hits = []
+    for root_dir in READ_DIRS:
+        root = os.path.realpath(root_dir)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                k = _key(f)
+                if k and (k == wk or wk in k or k in wk and len(k) >= 8):
+                    cand = os.path.realpath(os.path.join(dirpath, f))
+                    if cand.startswith(root + os.sep):
+                        hits.append(cand)
+    if len(hits) == 1:
+        return hits[0]
+    same_ext = [h for h in hits if h.lower().endswith(os.path.splitext(want)[1].lower())]
+    return max(same_ext, key=os.path.getmtime) if same_ext else None
+
+
+def _find_exact(want):
     for root_dir in READ_DIRS:
         root = os.path.realpath(root_dir)
         if not os.path.isdir(root):
