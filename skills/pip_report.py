@@ -36,19 +36,12 @@ def main():
         return 0
     shown = ", ".join(f"{p['name']} {p['version']}→{p['latest_version']}" for p in pkgs[:12])
     more  = f" and {len(pkgs) - 12} more" if len(pkgs) > 12 else ""
-    msg = (f"[Chip] Monthly package check: {len(pkgs)} Python package(s) have updates. "
+    msg = (f"Monthly package check: {len(pkgs)} Python package(s) have updates. "
            f"Nothing was changed. {shown}{more}. Full list: data/logs/pip_outdated.log")
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(30)
-        s.connect(os.getenv("SIGNAL_SOCKET", "/run/signal-cli/signal.sock"))
-        s.sendall((json.dumps({"jsonrpc": "2.0", "method": "send", "id": 1,
-                               "params": {"recipient": [chip_config.ADMIN_PHONE],
-                                          "message": msg}}) + "\n").encode())
-        s.recv(4096)
-        s.close()
-    except Exception as e:
-        print(f"signal send failed: {e}")
+    # Routine (One Voice spec A.3): goes in the nightly summary, not a buzz.
+    from skills import outbox
+    if outbox.notify("pip_report", msg, urgent=False, source="pip_report") == "failed":
+        print("outbox write failed")
         return 1
     return 0
 

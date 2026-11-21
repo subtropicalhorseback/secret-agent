@@ -1,0 +1,9 @@
+[Unit]
+Description=Chip home-route hard expiry — restore full-VPN default
+Documentation=file:/opt/chip/home_route.py
+
+[Service]
+Type=oneshot
+# Template: point this at your install (the workspace that holds data/logs).
+Environment=CHIP_WORKSPACE=/opt/chip
+ExecStart=/etc/chip/homeroute-expire.sh

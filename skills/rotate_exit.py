@@ -14,6 +14,19 @@ def rotate_node():
     if os.path.exists("/run/chip/mullvad_off"):
         print(f"[{timestamp}] mullvad_off flag present — skipping rotation.")
         return
+    # A scoped home-route lease is open (home_route.py). Re-pointing the exit
+    # node would churn the routing table underneath a live browser session.
+    # The flag carries its own expiry, so a stale one can't pause us forever.
+    if os.path.exists("/run/chip/rotate_paused"):
+        try:
+            expiry = open("/run/chip/rotate_paused").read().strip()
+        except Exception:
+            expiry = ""
+        if expiry and datetime.now().isoformat() > expiry:
+            print(f"[{timestamp}] rotate_paused expired — ignoring stale flag.")
+        else:
+            print(f"[{timestamp}] rotate_paused (home-route lease) — skipping rotation.")
+            return
     try:
         result = subprocess.check_output(["tailscale", "exit-node", "list"], text=True)
         valid_nodes = []

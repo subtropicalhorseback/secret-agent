@@ -89,8 +89,8 @@ async def claude(prompt, system=None, model=_llm.OPUS):
 # ── Web search ────────────────────────────────────────────────────────────────
 
 def search_sync(query, max_results=5):
-    from skills.web_utils import quick_search
-    results = quick_search(query, max_results=max_results)
+    from skills import gateway        # logged in the web log (spec C.3)
+    results = gateway.search(query, max_results=max_results)
     if isinstance(results, str):
         return []
     return results or []
@@ -185,13 +185,12 @@ async def handle_research(session, sender, clean_text, rag_context, history):
 
     all_sources = []
 
-    await send_signal(session,
-        f"Starting deep research: {query[:60]}...\n"
-        f"This takes 3-6 min. Reply !stop to cancel.",
-        recipient=sender)
+    from coordinator import working as _working
+    await _working()   # ⏳ instead of a progress message (One Voice A.2)
+    print('⋯ progress:', f"Starting deep research: {query[:60]}...\n" f"This takes 3-6 min. Reply !stop to cancel.")
 
     # ── Round 1: Query decomposition ──────────────────────────────────────────
-    await send_signal(session, "Round 1: Decomposing query...", recipient=sender)
+    print('⋯ progress:', "Round 1: Decomposing query...")
 
     decomp_prompt = (
         f"Break this research query into 4-5 specific sub-questions that together "
@@ -211,8 +210,7 @@ async def handle_research(session, sender, clean_text, rag_context, history):
         return "Research cancelled.", False
 
     # ── Round 1: Search ───────────────────────────────────────────────────────
-    await send_signal(session,
-        f"Searching {len(sub_questions)} sub-questions...", recipient=sender)
+    print('⋯ progress:', f"Searching {len(sub_questions)} sub-questions...")
 
     round1_results = {}
     for sq in sub_questions[:5]:
@@ -240,8 +238,8 @@ async def handle_research(session, sender, clean_text, rag_context, history):
                 page_text = ""
             if not page_text:
                 try:
-                    from skills.web_utils import scrape_url
-                    page_text = await asyncio.to_thread(scrape_url, top)
+                    from skills import gateway
+                    page_text, _meta = await asyncio.to_thread(gateway.fetch, top)
                 except Exception:
                     page_text = ""
             if page_text and "Search Error" not in page_text \
@@ -253,7 +251,7 @@ async def handle_research(session, sender, clean_text, rag_context, history):
         return "Research cancelled.", False
 
     # ── Round 1: First synthesis ──────────────────────────────────────────────
-    await send_signal(session, "Synthesizing round 1 findings...", recipient=sender)
+    print('⋯ progress:', "Synthesizing round 1 findings...")
 
     search_dump = "\n\n".join([
         f"SUB-QUESTION: {sq}\nRESULTS:\n{res}"
@@ -277,7 +275,7 @@ async def handle_research(session, sender, clean_text, rag_context, history):
         return "Research cancelled.", False
 
     # ── Round 2: Gap identification and follow-up search ─────────────────────
-    await send_signal(session, "Round 2: Filling gaps...", recipient=sender)
+    print('⋯ progress:', "Round 2: Filling gaps...")
 
     gap_prompt = (
         f"Extract the GAPS from this research draft as a JSON array of search queries. "
@@ -302,7 +300,7 @@ async def handle_research(session, sender, clean_text, rag_context, history):
         return "Research cancelled.", False
 
     # ── Round 2: Refined synthesis ────────────────────────────────────────────
-    await send_signal(session, "Refining synthesis...", recipient=sender)
+    print('⋯ progress:', "Refining synthesis...")
 
     gap_dump = "\n\n".join([
         f"GAP QUERY: {gq}\nRESULTS:\n{res}"
@@ -327,7 +325,7 @@ async def handle_research(session, sender, clean_text, rag_context, history):
         return "Research cancelled.", False
 
     # ── Crosscheck ────────────────────────────────────────────────────────────
-    await send_signal(session, "Crosscheck: Independent validation...", recipient=sender)
+    print('⋯ progress:', "Crosscheck: Independent validation...")
 
     crosscheck_prompt = (
         f"You are independently reviewing a research assessment. "
@@ -351,7 +349,7 @@ async def handle_research(session, sender, clean_text, rag_context, history):
         return "Research cancelled.", False
 
     # ── Final synthesis ───────────────────────────────────────────────────────
-    await send_signal(session, "Final synthesis...", recipient=sender)
+    print('⋯ progress:', "Final synthesis...")
 
     final_prompt = (
         f"You are producing a final research report. Integrate all findings.\n\n"

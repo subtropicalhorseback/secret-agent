@@ -1,0 +1,46 @@
+#!/usr/sbin/nft -f
+# Chip scoped home-route (see home_route.py). Applied ONLY for the duration of
+# a browse_task(route="home") lease; deleting the table restores full-VPN.
+#
+# Tailscale sends every packet to table 52 (default dev tailscale0) via
+# `ip rule 5270`, EXCEPT packets carrying its own bypass mark 0x80000, which
+# rule 5210 sends to the main table (default via the LAN gateway = home ISP).
+# So marking a socket's packets is a per-process split tunnel.
+#
+# Scope is the chip-browser.service cgroup and nothing else. Tailnet/LAN/
+# loopback destinations stay OFF the mark so MagicDNS (100.100.100.100) and
+# the noVNC live view keep working over tailscale0 while the lease is held.
+
+table inet chip_homeroute
+delete table inet chip_homeroute
+
+table inet chip_homeroute {
+	set keep_on_vpn {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+		             169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
+		             224.0.0.0/4 }
+	}
+	chain out {
+		type route hook output priority mangle; policy accept;
+		meta nfproto ipv4 \
+		    socket cgroupv2 level 2 "system.slice/chip-browser.service" \
+		    ip daddr != @keep_on_vpn \
+		    meta mark set 0x80000 counter
+	}
+}
+
+# The reroute above changes the route but NOT the source address: connect()
+# already picked the tailscale0 address (saddr is a valid local IP, so
+# ip_route_me_harder keeps it), and a 100.x source on the LAN is unanswerable.
+# Masquerade the marked flows to the outgoing LAN address to close that gap.
+table ip chip_homeroute_nat
+delete table ip chip_homeroute_nat
+
+table ip chip_homeroute_nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		meta mark 0x80000 oifname { "eth0", "wlan0" } counter masquerade
+	}
+}

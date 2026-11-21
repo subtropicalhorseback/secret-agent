@@ -64,6 +64,21 @@ def log(msg):
         pass
 
 
+def _tell(text, urgent=False, kind="vpn"):
+    """Through Chip's outbox (One Voice spec A.3): urgent events reach the
+    admin as one message worded by Chip; routine ones go in the nightly
+    summary. If Chip is down, the outbox sends urgent events directly."""
+    try:
+        sys.path.insert(0, WORKSPACE)
+        from skills import outbox
+        r = outbox.notify(kind, text, urgent=urgent, source="vpn_guard")
+        log(f"outbox {kind} ({'urgent' if urgent else 'routine'}): {r}")
+        return r != "failed"
+    except Exception as e:
+        log(f"outbox failed ({e}) — sending directly")
+        return signal_send(f"[Chip] {text}") if urgent else False
+
+
 def signal_send(message) -> bool:
     """Alert the admin over the signal-cli JSON-RPC socket (same path as
     signal_watchdog.py — deliberately not importing coordinator)."""
@@ -131,8 +146,28 @@ def flag_age():
         return None
 
 
+def enforce_home_route():
+    """Third and last line of defence over a scoped home-route lease
+    (home_route.py). The browse session releases its own lease, and a systemd
+    timer force-expires it at the 900s hard cap; this catches whatever both of
+    those missed — an orphaned rule with no lease, or a lease that outlived its
+    rule. Scoped home routing does NOT disturb the checks below: the box itself
+    is still on Mullvad, so this function is the only part of the guard that
+    needs to know about it."""
+    try:
+        sys.path.insert(0, WORKSPACE)
+        import home_route
+        verdict = home_route.enforce()
+        if verdict != "ok":
+            log(f"home-route enforce: {verdict}")
+            _tell(f"Home-route lease {verdict} — full VPN restored.", urgent=False, kind="lease")
+    except Exception as e:
+        log(f"home-route enforce failed: {e}")
+
+
 def main():
     os.makedirs(RUN_DIR, exist_ok=True)
+    enforce_home_route()
 
     if os.path.exists(OFF_FLAG):
         # Deliberate off-window (mullvad: off [minutes]). The flag body is the
@@ -144,7 +179,7 @@ def main():
                 os.remove(OFF_FLAG)
                 try_self_heal()
                 log("mullvad_off expired — re-enabled")
-                signal_send("[Chip] Mullvad off-window expired — VPN re-enabled.")
+                _tell("Mullvad off-window expired — VPN re-enabled.", urgent=False, kind="vpn_offwindow")
                 return 0
         except Exception as e:
             log(f"off-flag parse: {e}")
@@ -159,7 +194,7 @@ def main():
         if os.path.exists(DOWN_FLAG):
             os.remove(DOWN_FLAG)
             log(f"RECOVERED — exit={exit_node} | {detail}")
-            signal_send(f"[Chip] VPN all-clear. Mullvad restored via {exit_node}.\n{detail}")
+            _tell(f"VPN all-clear. Mullvad restored via {exit_node}.", urgent=True, kind="vpn_up")
         else:
             log(f"ok — state={state} exit={exit_node}")
         return 0
@@ -192,11 +227,11 @@ def main():
         if not first_time:
             os.utime(DOWN_FLAG, None)  # reset the re-alert clock
         down_for = "" if first_time else f" (down {age/3600:.1f}h)"
-        signal_send(
-            f"[Chip] ⚠️ VPN DOWN{down_for}\n{reason}\n\n"
+        _tell(
+            f"⚠️ VPN DOWN{down_for}\n{reason}\n\n"
             f"Outbound web lookups are refusing until this clears. "
-            f"Reply 'home ok' to allow home routing for 30 minutes."
-        )
+            f"Reply 'home ok' to allow home routing for 30 minutes.",
+            urgent=True, kind="vpn_down")
     return 1
 
 

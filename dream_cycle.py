@@ -575,6 +575,21 @@ def main():
     if os.path.exists(combined):
         open(combined, "w").close()
 
+    # Rolling records (One Voice spec B.5, 20 Nov 2026): the work log —
+    # worker traffic and every send-gate decision — is compressed nightly and
+    # pruned at 30 days, the same retention as the buffer archive above.
+    try:
+        from skills import worklog
+        _c, _d = worklog.roll()
+        print(f"📦 Work log rolled: {_c} day(s) compressed, {_d} pruned")
+        from skills import gateway
+        _c, _d = worklog.roll(directory=gateway.weblog_dir())
+        _p, _o = gateway.prune()
+        print(f"📦 Web log rolled: {_c} compressed, {_d} pruned; cache pruned "
+              f"{_p} page(s) >30d, {_o} observation(s) >12mo")
+    except Exception as e:
+        print(f"⚠️ Work/web log roll failed: {e}")
+
     active_count = conn.execute(
         "SELECT COUNT(*) FROM facts WHERE confirmed=1 AND status='active'"
     ).fetchone()[0]
@@ -611,6 +626,20 @@ def main():
             msg_parts.extend(f"  • {p}" for p in _problems)
     except Exception as _e:
         msg_parts.append(f"\n⏱️ Could not check scheduled jobs: {_e}")
+
+    # Routine system events from the outbox (One Voice spec A.3): lease
+    # releases, package checks, queued heals — reported here once a day
+    # instead of buzzing the phone when they happen.
+    try:
+        from skills import outbox
+        _events = outbox.take_digest()
+        if _events:
+            msg_parts.append(f"\n🗒️ System events ({len(_events)}):")
+            msg_parts += [f"  {e}" for e in _events[-15:]]
+            if len(_events) > 15:
+                msg_parts.append(f"  …and {len(_events) - 15} earlier")
+    except Exception as _e:
+        msg_parts.append(f"\n🗒️ Could not read system events: {_e}")
 
     msg_parts.append(f"\n📊 Active memory: {active_count} facts")
     msg_parts.append("Use memory: to correct anything.")

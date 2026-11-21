@@ -192,6 +192,16 @@ def get_monthly_report(year=None, month=None, verbose=False):
         f"  Gemini:  {totals['gemini']['calls']} calls · "
         f"{totals['gemini']['tokens']:,} tok · ${totals['gemini']['cost']:.4f}",
     ]
+    # Heal and build runs (Claude Code sessions) are billed outside the call
+    # log above, so they are counted here, once, from the fix index (spec D.7).
+    try:
+        from skills import fix_index
+        heal_cost, heal_runs = fix_index.spend_since(f"{prefix}-01T00:00:00")
+        if heal_runs:
+            lines.append(f"  Heals:   {heal_runs} run(s) · ${heal_cost:.2f} "
+                         f"(Claude Code sessions, not in the totals above)")
+    except Exception:
+        pass
 
     if verbose:
         lines.append("")
@@ -212,15 +222,22 @@ async def weekly_report_task(session):
         now    = datetime.now(cst)
         # Next Friday 09:00
         days_ahead = (4 - now.weekday()) % 7 or 7  # 4 = Friday
-        target = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        target = target.replace(day=(now + __import__('datetime').timedelta(days=days_ahead)).day)
-        wait   = (target - now).total_seconds()
+        # Date arithmetic, not replace(day=…): when next Friday fell in the
+        # next month, replace() put the target in the PAST, the sleep returned
+        # at once, and the loop resent the report with no wait at all — every
+        # admin, as fast as Signal would take it (found 20 Nov 2026, would
+        # first have fired 27 Nov). The floor below makes a past target
+        # impossible whatever the arithmetic does.
+        from datetime import timedelta as _td
+        target = (now + _td(days=days_ahead)).replace(
+            hour=9, minute=0, second=0, microsecond=0)
+        wait   = max((target - now).total_seconds(), 3600)
         await asyncio.sleep(wait)
         report = get_monthly_report(verbose=False)
         for phone, info in USERS.items():
             if info["tier"] == "admin":
                 await send_signal(session, f"[Chip] Weekly usage:\n{report}",
-                                  recipient=phone)
+                                  recipient=phone, kind="scheduled")
 
 # ─── Handler ──────────────────────────────────────────────────────────────────
 

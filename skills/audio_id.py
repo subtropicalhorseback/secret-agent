@@ -450,8 +450,9 @@ async def handle_audio_id(session, sender, clean_text, rag_context, history):
     selected, user_note = parse_selection(clean_text, queue)
     clip_count          = len(selected)
 
-    await send_signal(session,
-        f"Analyzing {clip_count} clip(s)...", recipient=sender)
+    from coordinator import working as _working
+    await _working()   # ⏳ instead of a progress message (One Voice A.2)
+    print('⋯ progress:', f"Analyzing {clip_count} clip(s)...")
 
     clips    = [convert_to_wav(e["path"]) for e in selected]
     from chip_config import HOME_LOCATION

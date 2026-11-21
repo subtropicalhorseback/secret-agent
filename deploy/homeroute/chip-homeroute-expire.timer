@@ -1,0 +1,11 @@
+[Unit]
+Description=Chip home-route hard cap (900s — matches browse.py TIME_CAP)
+
+[Timer]
+# Armed by home_route.py acquire; `systemctl restart` resets the countdown.
+# This is the FAIL-SAFE: it fires even if the coordinator is SIGKILLed, so a
+# crashed browse session cannot leave the box on the home route.
+OnActiveSec=900
+AccuracySec=1s
+RemainAfterElapse=no
+Unit=chip-homeroute-expire.service

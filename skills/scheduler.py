@@ -502,6 +502,7 @@ def load_registry():
             "protected": protected,
             "runner": str(e.get("runner", "dispatcher")),
             "timeout_seconds": int(e.get("timeout_seconds", 300)),
+            "max_failures": max(1, int(e.get("max_failures", 3))),
             "env": {str(k): str(v) for k, v in (e.get("env") or {}).items()},
             "warn_on_disable": e.get("warn_on_disable"),
         }
@@ -520,6 +521,36 @@ def load_registry():
     return jobs
 
 
+_ERRORISH = ("error", "no such", "cannot", "not found", "denied", "refused",
+             "traceback", "failed to", "fatal", "exception", "timed out")
+
+# Lines that announce a failure without saying what it was. tar signs off with
+# "Exiting with failure status due to previous errors" and backup.sh adds
+# "Backup FAILED" — both match an error keyword, neither is the cause.
+_GENERIC = ("previous error", "exiting with failure", "see above",
+            "error(s) occurred", "errors occurred")
+
+
+def tail_highlight(tail):
+    """The most useful single line of a captured output tail.
+
+    The literal last line is usually the script's own epilogue, which says
+    nothing the exit code didn't. Prefer the last line that names a cause
+    ("tar: ... Cannot stat: No such file or directory"), ignoring generic
+    wrap-up lines, and fall back only if nothing better is there.
+    """
+    lines = [ln.strip() for ln in (tail or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    errorish = [ln for ln in lines if any(k in ln.lower() for k in _ERRORISH)]
+    specific = [ln for ln in errorish
+                if not any(g in ln.lower() for g in _GENERIC)]
+    for candidates in (specific, errorish, lines):
+        if candidates:
+            return candidates[-1]
+    return ""
+
+
 def _interval(expr, now=None):
     a = next_fire(expr, now)
     b = next_fire(expr, a) if a else None
@@ -532,9 +563,17 @@ def registry_entries():
     rows = []
     for j in load_registry():
         s = state.get(j["name"], {})
-        rows.append({**{k: j[k] for k in ("name", "schedule", "enabled", "protected", "runner", "warn_on_disable")},
+        rows.append({**{k: j[k] for k in ("name", "schedule", "enabled", "protected",
+                                          "runner", "warn_on_disable", "max_failures")},
                      "last_run": s.get("last_run"), "last_success": s.get("last_success"),
+                     "last_start": s.get("last_start"), "last_finish": s.get("last_finish"),
+                     "duration_seconds": s.get("duration_seconds"),
                      "last_exit_code": s.get("last_exit_code"),
+                     "last_outcome": s.get("last_outcome"),
+                     "last_note": s.get("last_note"),
+                     # The diagnosable bit: why it failed, not just that it did.
+                     "last_output_tail": s.get("last_output_tail"),
+                     "alerted": bool(s.get("alerted")),
                      "consecutive_failures": s.get("consecutive_failures", 0)})
     return rows
 
@@ -552,8 +591,12 @@ def registry_problems(now=None):
             continue
         s = state.get(j["name"], {})
         fails = s.get("consecutive_failures", 0)
-        if fails >= 3:
-            out.append(f"{j['name']}: {fails} failures in a row (last exit {s.get('last_exit_code')})")
+        if fails >= j["max_failures"]:
+            why = s.get("last_outcome") or "exit"
+            hint = tail_highlight(s.get("last_output_tail"))
+            because = f" - {hint[:120]}" if hint else ""
+            out.append(f"{j['name']}: {fails} failures in a row "
+                       f"({why}, exit {s.get('last_exit_code')}){because}")
             continue
         since = s.get("last_success") or s.get("first_seen")
         if since:

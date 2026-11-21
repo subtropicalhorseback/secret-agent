@@ -45,8 +45,16 @@ from skills import scheduler as S                    # noqa: E402
 
 WORKSPACE = chip_config.WORKSPACE
 LOCK_DIR  = f"{WORKSPACE}/data/job_locks"
-ALERT_AT  = 3                                        # consecutive failures before telling the admin
+ALERT_AT  = 3                                        # default consecutive failures before telling the admin
 MAX_CATCHUP = timedelta(hours=S.MAX_CATCHUP_HOURS)
+TAIL_LINES  = 50                                     # how much of a failing run is worth keeping
+TAIL_CHARS  = 4000                                   # hard cap: a chatty job must not fill job_state.json
+
+# Outcomes recorded in run state. A timeout is NOT the same event as a job
+# that chose to exit non-zero, and neither is an overrun skip — they want
+# different fixes, so they are named separately rather than all being "exit 1".
+OUT_OK, OUT_FAILED, OUT_TIMEOUT, OUT_OVERRUN, OUT_ERROR = (
+    "ok", "failed", "timeout", "overrun", "error")
 
 
 def log(msg):
@@ -54,8 +62,22 @@ def log(msg):
 
 
 def alert(message):
-    """Tell the admin directly over the signal-cli socket. Independent of the
-    coordinator, which may be the thing that is broken."""
+    """Urgent: through Chip's outbox (One Voice spec A.3), which sends it
+    directly when Chip is not consuming — so it still arrives if the
+    coordinator is the thing that is broken."""
+    try:
+        from skills import outbox
+        r = outbox.notify("job_failure", message.removeprefix("[Chip] "),
+                          urgent=True, source="dispatcher")
+        if r != "failed":
+            return True
+    except Exception as e:
+        log(f"outbox failed ({e}) — sending directly")
+    return _alert_direct(message)
+
+
+def _alert_direct(message):
+    """Last resort: straight to the signal-cli socket."""
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(30)
@@ -88,12 +110,15 @@ def run_one(name):
         log(f"{name}: not a dispatcher job")
         return 2
     os.makedirs(LOCK_DIR, exist_ok=True)
+    # flock, not a PID file: the kernel drops the lock when the holder dies, so
+    # a dispatcher killed mid-job leaves nothing stale to clean up by hand.
     lock = open(f"{LOCK_DIR}/{name}.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         log(f"{name}: previous run still going - skipped")
-        _record(name, exit_code=-1, note="overrun")
+        _record(name, exit_code=-1, outcome=OUT_OVERRUN,
+                note="still running when the next slot came round - skipped, not queued")
         return 1
 
     env = dict(os.environ)
@@ -101,6 +126,17 @@ def run_one(name):
     env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     env.update(job["env"])
     os.makedirs(os.path.dirname(job["log"]), exist_ok=True)
+
+    # Where the job's log ends before we start. Everything appended past this
+    # point is this run's output — which catches BOTH what we capture off the
+    # pipe AND what the job writes to the same log itself. backup.sh sends tar's
+    # stderr straight to the log with `2>> "$LOG"`, so a pipe-only capture saw
+    # nothing and recorded a bare "exit 1" for six nights running.
+    try:
+        offset = os.path.getsize(job["log"])
+    except OSError:
+        offset = 0
+
     started = datetime.now()
     try:
         with open(job["log"], "a") as lf:
@@ -108,7 +144,8 @@ def run_one(name):
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
             try:
-                code, note = proc.wait(timeout=job["timeout_seconds"]), ""
+                code, outcome, note = proc.wait(timeout=job["timeout_seconds"]), None, ""
+                outcome = OUT_OK if code == 0 else OUT_FAILED
             except subprocess.TimeoutExpired:
                 import signal as _sig                # take the shell's children down too
                 try:
@@ -118,32 +155,77 @@ def run_one(name):
                 proc.wait()
                 raise
     except subprocess.TimeoutExpired:
-        code, note = -2, f"timed out after {job['timeout_seconds']}s"
+        code, outcome, note = -2, OUT_TIMEOUT, f"hard killed after {job['timeout_seconds']}s"
     except Exception as e:
-        code, note = -3, str(e)[:200]
-    secs = (datetime.now() - started).total_seconds()
-    log(f"{name}: exit {code} in {secs:.0f}s {note}")
-    _record(name, exit_code=code, note=note)
+        code, outcome, note = -3, OUT_ERROR, str(e)[:200]
+
+    finished = datetime.now()
+    secs = (finished - started).total_seconds()
+    log(f"{name}: {outcome} (exit {code}) in {secs:.0f}s {note}")
+    _record(name, exit_code=code, outcome=outcome, note=note,
+            started=started, finished=finished, duration=secs,
+            tail=_tail_since(job["log"], offset))
     return 0 if code == 0 else 1
 
 
-def _record(name, exit_code, note=""):
+def _tail_since(path, offset):
+    """The last TAIL_LINES of whatever this run appended to its log. Capped on
+    both ends: we seek to the run's own start so an old log can't be mistaken
+    for fresh output, and we keep only the tail so a chatty job can't bloat
+    state. TAIL_CHARS is the backstop for a job that writes few but enormous
+    lines, so one run can never add more than ~4KB to job_state.json."""
+    try:
+        size = os.path.getsize(path)
+        if size <= offset:
+            return ""
+        with open(path, "r", errors="replace") as fh:
+            fh.seek(max(offset, size - TAIL_CHARS))
+            lines = fh.read(TAIL_CHARS).splitlines()
+        return "\n".join(lines[-TAIL_LINES:]).strip()
+    except Exception:
+        return ""
+
+
+def _record(name, exit_code, outcome=None, note="", started=None,
+            finished=None, duration=None, tail=""):
     now = datetime.now().isoformat()
+    if outcome is None:
+        outcome = OUT_OK if exit_code == 0 else OUT_FAILED
+    try:
+        limit = next(j["max_failures"] for j in S.load_registry() if j["name"] == name)
+    except Exception:
+        limit = ALERT_AT
     hit = {}
 
     def _m(d):
         s = d.setdefault(name, {})
-        s["last_run"], s["last_exit_code"], s["last_note"] = now, exit_code, note
+        s["last_run"] = s["last_finish"] = finished.isoformat() if finished else now
+        if started:
+            s["last_start"] = started.isoformat()
+        if duration is not None:
+            s["duration_seconds"] = round(duration, 1)
+        s["last_exit_code"], s["last_outcome"], s["last_note"] = exit_code, outcome, note
+        s["last_output_tail"] = tail
         if exit_code == 0:
             s["last_success"], s["consecutive_failures"] = now, 0
+            s["alerted"] = False                     # recovered: re-arm the alert
         else:
             s["consecutive_failures"] = s.get("consecutive_failures", 0) + 1
-        hit["fails"] = s["consecutive_failures"]
+        # Decide to alert INSIDE the locked write, so two jobs finishing in the
+        # same second cannot both read "not yet alerted" and both page.
+        hit["fire"] = (exit_code != 0
+                       and s["consecutive_failures"] >= limit
+                       and not s.get("alerted"))
+        if hit["fire"]:
+            s["alerted"] = True                      # silent until it succeeds again
+            hit["fails"] = s["consecutive_failures"]
     S._json_rw(S.STATE_FILE, _m, default={})
-    if hit.get("fails") == ALERT_AT:                 # once, at the threshold - not every tick
-        alert(f"[Chip] Scheduled job '{name}' has failed {ALERT_AT} times in a row "
-              f"(last exit {exit_code}{', ' + note if note else ''}). "
-              f"Its log is data/logs/. Ask me to list scheduled jobs for details.")
+    if hit.get("fire"):
+        snippet = f"\n\nLast output:\n{tail[-400:]}" if tail else ""
+        alert(f"[Chip] Scheduled job '{name}' has failed {hit['fails']} times in a row "
+              f"({outcome}, exit {exit_code}{', ' + note if note else ''}). "
+              f"No further alerts for this job until it succeeds. "
+              f"Ask me to list scheduled jobs for details.{snippet}")
 
 
 # ─── the tick ─────────────────────────────────────────────────────────────────

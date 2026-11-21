@@ -21,7 +21,15 @@ Design-intent deviations from the draft, each deliberate:
   answer to the Mullvad device-limit question. Profiles stay split per route
   (mullvad/ vs direct/) exactly as specced, so cookies never link the two.
 
-Everything else is as drafted: one session at a time, 10-min idle timeout,
+Tabs (20 Nov 2026, One Voice spec C.2): up to several workers share one
+Chromium, one TAB each. Every op names its tab (default "main"). The route is
+a property of the whole browser — the home-route lease marks this unit's
+cgroup — so a route change is refused while any other tab is open; the
+coordinator's gateway (skills/gateway.py) makes the home route exclusive so
+this refusal is a backstop, never the normal path. Per-tab locks, so one slow
+page no longer stalls every other tab; a context lock guards route changes.
+
+Otherwise as drafted: 10-min idle timeout (per tab),
 DOM snapshot with element refs, coordinate-mode actions for the cursor
 fallback, headed Chromium under Xvfb with x11vnc + noVNC bound to the
 Tailscale interface for watch/take-over, downloads refused, visit log.
@@ -87,16 +95,28 @@ def _tailscale_ip():
         return "127.0.0.1"
 
 
+class RouteConflict(Exception):
+    pass
+
+
+class Tab:
+    def __init__(self, page, user="?"):
+        self.page = page
+        self.refs = []          # ref index -> locator index
+        self.user = user
+        self.last = time.time()
+        self.lock = asyncio.Lock()
+
+
 class BrowserService:
     def __init__(self):
         self.pw = None
         self.ctx = None
-        self.page = None
         self.route = None
-        self.user = "?"
-        self.refs = []          # ref index -> locator descriptor
+        self.tabs = {}          # tab id -> Tab
+        self.spare = []         # pages the persistent context opened on its own
+        self.ctx_lock = asyncio.Lock()
         self.last_activity = time.time()
-        self.lock = asyncio.Lock()
         self.display_procs = []
 
     # ── display stack (Xvfb + x11vnc + noVNC on the tailnet) ─────────────
@@ -121,10 +141,16 @@ class BrowserService:
 
     # ── browser lifecycle ────────────────────────────────────────────────
     async def ensure(self, route):
+        """Caller holds ctx_lock. Opens the context for `route`; refuses to
+        switch routes while any tab is open (cookies must never cross)."""
         from playwright.async_api import async_playwright
         if self.pw is None:
             self.pw = await async_playwright().start()
         if self.ctx and self.route != route:
+            if self.tabs:
+                raise RouteConflict(
+                    f"route change {self.route} -> {route} refused: "
+                    f"{len(self.tabs)} tab(s) open ({', '.join(self.tabs)})")
             await self.close_ctx()
         if self.ctx is None:
             prof = f"{PROFILE_DIR}/{'direct' if route == 'home' else 'mullvad'}"
@@ -134,9 +160,37 @@ class BrowserService:
                 viewport={"width": 1280, "height": 900},
                 accept_downloads=False,
                 args=["--no-sandbox", "--disable-dev-shm-usage"])
-            self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+            self.spare = list(self.ctx.pages)
             self.route = route
         self.last_activity = time.time()
+
+    async def get_tab(self, tab_id, route=None, create=False, user="?"):
+        async with self.ctx_lock:
+            t = self.tabs.get(tab_id)
+            if t is not None and route and route != self.route:
+                raise RouteConflict(f"tab {tab_id} is on {self.route}, asked for {route}")
+            if t is None and create:
+                await self.ensure(route or "mullvad")
+                page = self.spare.pop() if self.spare else await self.ctx.new_page()
+                t = Tab(page, user)
+                self.tabs[tab_id] = t
+            if t is not None:
+                t.last = self.last_activity = time.time()
+            return t
+
+    async def close_tab(self, tab_id):
+        async with self.ctx_lock:
+            t = self.tabs.pop(tab_id, None)
+            if t is not None:
+                try:
+                    await t.page.close()
+                except Exception:
+                    pass
+            if not self.tabs:
+                # Last tab gone: close the context too, so the next route
+                # starts clean and no cookies linger in memory.
+                await self.close_ctx()
+            return t is not None
 
     async def close_ctx(self):
         try:
@@ -144,37 +198,42 @@ class BrowserService:
                 await self.ctx.close()
         except Exception:
             pass
-        self.ctx = self.page = None
-        self.refs = []
+        self.ctx = None
+        self.route = None
+        self.tabs = {}
+        self.spare = []
 
     async def idle_reaper(self):
         while True:
             await asyncio.sleep(60)
-            if self.ctx and time.time() - self.last_activity > IDLE_SECS:
-                async with self.lock:
-                    print("⌛ idle timeout — closing browser context")
+            for tid, t in list(self.tabs.items()):
+                if time.time() - t.last > IDLE_SECS:
+                    print(f"⌛ idle timeout — closing tab {tid}")
+                    await self.close_tab(tid)
+            if self.ctx and not self.tabs and time.time() - self.last_activity > IDLE_SECS:
+                async with self.ctx_lock:
                     await self.close_ctx()
 
     # ── ops ──────────────────────────────────────────────────────────────
-    async def op_open(self, req):
-        route = req.get("route", "mullvad")
-        self.user = req.get("user", self.user)
-        await self.ensure(route)
+    async def op_open(self, req, t):
+        route = self.route
         url = req["url"]
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        await self.page.wait_for_timeout(1500)
-        log_visit(self.user, url, route)
-        return {"ok": True, "title": await self.page.title(),
-                "url": self.page.url, "route": route}
+        resp = await t.page.goto(url, timeout=30000,
+                                 wait_until="domcontentloaded")
+        await t.page.wait_for_timeout(1500)
+        log_visit(t.user, url, route)
+        # The HTTP status is the cheapest signal that a page was blocked rather
+        # than merely unhelpful (403/429 vs a 200 with no results); the run
+        # artifact records it per step. None for same-document navigations.
+        return {"ok": True, "title": await t.page.title(),
+                "url": t.page.url, "route": route,
+                "status": resp.status if resp else None}
 
-    async def op_read(self, req):
-        if not self.page:
-            return {"ok": False, "error": "no page open"}
-        self.last_activity = time.time()
+    async def op_read(self, req, t):
         els, out = [], []
-        loc = self.page.locator(", ".join(INTERACTIVE))
+        loc = t.page.locator(", ".join(INTERACTIVE))
         count = min(await loc.count(), 120)
         for i in range(count):
             el = loc.nth(i)
@@ -190,23 +249,24 @@ class BrowserService:
                 out.append(f"[{len(els)-1}] <{tag}> {text}")
             except Exception:
                 continue
-        self.refs = els
+        t.refs = els
         body = ""
+        # Default 5000 keeps fetch_page() (research:/archive:) as it was; the
+        # browse loop asks for more and does its own budgeting + paging, so
+        # read_more has something left to page through (browse.py).
+        cap = int(req.get("max_chars") or 5000)
         try:
-            body = (await self.page.inner_text("body", timeout=3000))[:5000]
+            body = (await t.page.inner_text("body", timeout=3000))[:cap]
         except Exception:
             pass
-        return {"ok": True, "title": await self.page.title(), "url": self.page.url,
+        return {"ok": True, "title": await t.page.title(), "url": t.page.url,
                 "elements": "\n".join(out[:120]), "text": body}
 
-    async def op_act(self, req):
-        if not self.page:
-            return {"ok": False, "error": "no page open"}
-        self.last_activity = time.time()
+    async def op_act(self, req, t):
         ref, action = int(req["ref"]), req["action"]
-        if ref < 0 or ref >= len(self.refs):
+        if ref < 0 or ref >= len(t.refs):
             return {"ok": False, "error": f"stale ref {ref} — call read again"}
-        el = self.page.locator(", ".join(INTERACTIVE)).nth(self.refs[ref])
+        el = t.page.locator(", ".join(INTERACTIVE)).nth(t.refs[ref])
         try:
             if action == "click":
                 await el.click(timeout=8000)
@@ -218,48 +278,49 @@ class BrowserService:
                 await el.scroll_into_view_if_needed(timeout=8000)
             else:
                 return {"ok": False, "error": f"unknown action {action}"}
-            await self.page.wait_for_timeout(1200)
-            return {"ok": True, "title": await self.page.title(), "url": self.page.url}
+            await t.page.wait_for_timeout(1200)
+            return {"ok": True, "title": await t.page.title(), "url": t.page.url}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
-    async def op_screenshot(self, req):
-        if not self.page:
-            return {"ok": False, "error": "no page open"}
-        self.last_activity = time.time()
-        png = await self.page.screenshot(type="jpeg", quality=60)
+    async def op_screenshot(self, req, t):
+        png = await t.page.screenshot(type="jpeg", quality=60)
         return {"ok": True, "image_b64": base64.b64encode(png).decode(),
-                "media_type": "image/jpeg", "url": self.page.url}
+                "media_type": "image/jpeg", "url": t.page.url}
 
-    async def op_cursor(self, req):
-        if not self.page:
-            return {"ok": False, "error": "no page open"}
-        self.last_activity = time.time()
+    async def op_cursor(self, req, t):
         op = req["op"]
         try:
             if op == "click_xy":
-                await self.page.mouse.click(float(req["x"]), float(req["y"]))
+                await t.page.mouse.click(float(req["x"]), float(req["y"]))
             elif op == "type_text":
-                await self.page.keyboard.type(req.get("text", ""), delay=25)
+                await t.page.keyboard.type(req.get("text", ""), delay=25)
             elif op == "key":
-                await self.page.keyboard.press(req.get("key", "Enter"))
+                await t.page.keyboard.press(req.get("key", "Enter"))
             elif op == "scroll":
-                await self.page.mouse.wheel(0, float(req.get("dy", 600)))
-            await self.page.wait_for_timeout(900)
-            return {"ok": True, "url": self.page.url}
+                await t.page.mouse.wheel(0, float(req.get("dy", 600)))
+            await t.page.wait_for_timeout(900)
+            return {"ok": True, "url": t.page.url}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
     async def op_status(self, req):
         return {"ok": True,
                 "open": bool(self.ctx),
-                "url": self.page.url if self.page else None,
+                "tabs": {tid: t.page.url for tid, t in self.tabs.items()},
+                "url": next((t.page.url for t in self.tabs.values()), None),
                 "route": self.route,
                 "novnc": f"http://{_tailscale_ip()}:{NOVNC_PORT}/vnc.html",
                 "idle_secs": int(time.time() - self.last_activity)}
 
     async def op_close(self, req):
-        await self.close_ctx()
+        """Close the whole browser. Refused while other tabs are open unless
+        forced — a worker closes its own tab with tab_close."""
+        async with self.ctx_lock:
+            others = [tid for tid in self.tabs if tid != req.get("tab")]
+            if others and not req.get("force"):
+                return {"ok": False, "error": f"other tabs open: {', '.join(others)}"}
+            await self.close_ctx()
         return {"ok": True}
 
     # ── server ───────────────────────────────────────────────────────────
@@ -268,23 +329,37 @@ class BrowserService:
             line = await asyncio.wait_for(reader.readline(), timeout=120)
             req  = json.loads(line.decode())
             op   = req.get("op", "")
-            async with self.lock:
-                if op == "open":
-                    resp = await self.op_open(req)
-                elif op == "read":
-                    resp = await self.op_read(req)
-                elif op == "act":
-                    resp = await self.op_act(req)
-                elif op == "screenshot":
-                    resp = await self.op_screenshot(req)
-                elif op in ("click_xy", "type_text", "key", "scroll"):
-                    resp = await self.op_cursor(req)
-                elif op == "status":
-                    resp = await self.op_status(req)
-                elif op == "close":
-                    resp = await self.op_close(req)
+            tab_id = str(req.get("tab") or "main")
+            if op == "status":
+                resp = await self.op_status(req)
+            elif op == "close":
+                resp = await self.op_close(req)
+            elif op == "tab_close":
+                resp = {"ok": await self.close_tab(tab_id)}
+            elif op in ("open", "read", "act", "screenshot",
+                        "click_xy", "type_text", "key", "scroll"):
+                t = await self.get_tab(tab_id, route=req.get("route"),
+                                       create=(op == "open"),
+                                       user=req.get("user", "?"))
+                if t is None:
+                    resp = {"ok": False, "error": f"no page open in tab {tab_id}"}
                 else:
-                    resp = {"ok": False, "error": f"unknown op {op}"}
+                    async with t.lock:
+                        t.last = self.last_activity = time.time()
+                        if op == "open":
+                            resp = await self.op_open(req, t)
+                        elif op == "read":
+                            resp = await self.op_read(req, t)
+                        elif op == "act":
+                            resp = await self.op_act(req, t)
+                        elif op == "screenshot":
+                            resp = await self.op_screenshot(req, t)
+                        else:
+                            resp = await self.op_cursor(req, t)
+            else:
+                resp = {"ok": False, "error": f"unknown op {op}"}
+        except RouteConflict as e:
+            resp = {"ok": False, "error": f"route conflict: {e}", "route_conflict": True}
         except Exception as e:
             resp = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
         try:

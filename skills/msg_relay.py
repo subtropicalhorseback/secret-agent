@@ -137,7 +137,7 @@ async def handle_msg(session, sender, clean_text, rag_context, history):
         summary = await summarize(sender_name, name, topic, history, active)
         intro   = f"{sender_name} asked me to share this with you:\n\n"
         message = intro + summary
-        await send_signal(session, message, recipient=phone)
+        await send_signal(session, message, recipient=phone, kind="relay")
         results.append(name)
 
     return f"Sent to {', '.join(results)}.", False

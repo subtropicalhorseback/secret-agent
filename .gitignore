@@ -21,7 +21,8 @@ coordinator.log
 venv/
 __pycache__/
 *.pyc
-.claude/
+.claude/*
+!.claude/skills/
 
 # ─── Local-only artifacts ────────────────────────────────────────────────────
 *.bak*

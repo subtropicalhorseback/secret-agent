@@ -76,3 +76,26 @@ ANALYTICAL_TRIGGERS = [
 # belong to another user and must be EXCLUDED from the admin's domain signals.
 ADMIN_VOCABULARY = set()
 PARTNER_TOPICS = set()
+
+# ── Browse run timing and handoff (FIX-0006, 20 Nov 2026) ─────────────────────
+# Read through skills/browse_capture.conf(), which falls back to the same
+# defaults if this file is missing or unreadable.
+#
+# The delay bounds are per-request cosmetic hygiene applied before each
+# discrete interaction (click, form field entry, submit). They are explicitly
+# NOT a volume control and must not be repurposed as one.
+BROWSE_ACTION_DELAY_MIN  = 0.3     # seconds, uniform random, lower bound
+BROWSE_ACTION_DELAY_MAX  = 1.3     # seconds, uniform random, upper bound
+
+# Ranked candidate readings the vision oracle returns, and therefore the
+# retry budget a caller may burn through before giving up on a capture.
+BROWSE_VISION_CANDIDATES = 3
+
+# How long a browse worker blocks waiting for the coordinator to reply DOWN
+# before taking its defined default (finalise, record the timeout, emit a
+# terminus to the user). Blocking forever is prohibited.
+BROWSE_REPLY_DEADLINE_S  = 90
+
+# Heartbeat age at which a run counts as stalled and the staleness check
+# synthesises a stall notice. Must exceed the slowest legitimate single step.
+BROWSE_STALL_AFTER_S     = 180

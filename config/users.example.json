@@ -9,7 +9,8 @@
       "history": 30,
       "default_model": "cloud_heavy",
       "persona": "Alex: admin. Describe tone/persona for this user.",
-      "profile_focus": "Capture who Alex is: role, projects, recent decisions."
+      "profile_focus": "Capture who Alex is: role, projects, recent decisions.",
+      "style": "Optional. How this user writes and what they want back, e.g. 'Answer first, two or three sentences, no preamble. Say what you checked and what you are recalling.' Injected into the cached prompt for this user only."
     },
     "+15550100002": {
       "name": "Blake",

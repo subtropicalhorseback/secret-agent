@@ -345,8 +345,8 @@ async def run_mode0(session, full_name, focus):
 # ── Web search helper ─────────────────────────────────────────────────────────
 
 def web_search_sync(query, max_results=5):
-    from skills.web_utils import quick_search
-    results = quick_search(query, max_results=max_results)
+    from skills import gateway        # logged in the web log (spec C.3)
+    results = gateway.search(query, max_results=max_results)
     if isinstance(results, str):
         return results
     return "\n---\n".join([
@@ -396,8 +396,7 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
         base_target = ' '.join(clean_text.strip().split()[:-1])
         entity      = await detect_entity_and_focus(session, base_target)
         full_name   = entity.get('full_name', base_target)
-        await send_signal(session,
-            f'Diffing last two {full_name} reports...', recipient=sender)
+        print('⋯ progress:', f'Diffing last two {full_name} reports...')
         answer, force_file = await run_diff(session, sender, full_name, None)
         _save_report_to_disk(answer, sender,
             f'Diff_{full_name.replace(" ","_")}',
@@ -420,20 +419,16 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
     resume_from = []
     if incomplete:
         inc_dir, completed_modes = incomplete
-        await send_signal(session,
-            f"Found incomplete run with {len(completed_modes)} mode(s) completed "
-            f"({', '.join(completed_modes)}). Resuming...",
-            recipient=sender)
+        print('⋯ progress:', f"Found incomplete run with {len(completed_modes)} mode(s) completed " f"({', '.join(completed_modes)}). Resuming...")
         report_dir  = inc_dir
         resume_from = completed_modes
         run_ts      = os.path.basename(inc_dir)
 
     focus_str = f" — {focus}" if focus else ""
     modes_str = "Modes 0-3" if etype == "company" else "Modes 1-3"
-    await send_signal(session,
-        f"Analyzing {full_name}{focus_str} as a {etype}. "
-        f"{modes_str} + crosscheck. ~4-8 min. Reply !stop to cancel.",
-        recipient=sender)
+    from coordinator import working as _working
+    await _working()   # ⏳ instead of a progress message (One Voice A.2)
+    print('⋯ progress:', f"Analyzing {full_name}{focus_str} as a {etype}. " f"{modes_str} + crosscheck. ~4-8 min. Reply !stop to cancel.")
 
     # Index as in-progress
     index_report(full_name, etype, focus, run_ts, report_dir, None, completed=0)
@@ -446,7 +441,7 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
         if "mode0" in resume_from:
             outputs["mode0"] = load_checkpoint(report_dir, "mode0")
         else:
-            await send_signal(session, "Mode 0: Quantitative baseline...", recipient=sender)
+            print('⋯ progress:', "Mode 0: Quantitative baseline...")
             outputs["mode0"] = await run_mode0(session, full_name, focus)
             save_checkpoint(report_dir, "mode0", outputs["mode0"])
         if cancel_flags.get(sender):
@@ -456,7 +451,7 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
     if "mode1" in resume_from:
         outputs["mode1"] = load_checkpoint(report_dir, "mode1")
     else:
-        await send_signal(session, "Mode 1: Historical context...", recipient=sender)
+        print('⋯ progress:', "Mode 1: Historical context...")
         m1_template = load_mode("mode1_historical.md")
         m1_prompt   = inject_focus(
             inject_prior_reports(
@@ -475,7 +470,7 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
     if "mode2" in resume_from:
         outputs["mode2"] = load_checkpoint(report_dir, "mode2")
     else:
-        await send_signal(session, "Mode 2: Leadership profiles...", recipient=sender)
+        print('⋯ progress:', "Mode 2: Leadership profiles...")
         m2_template = load_mode("mode2_leadership.md")
         m2_prompt   = inject_focus(
             m2_template.replace("[TARGET]", full_name)
@@ -491,7 +486,7 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
     if "mode3" in resume_from:
         outputs["mode3"] = load_checkpoint(report_dir, "mode3")
     else:
-        await send_signal(session, "Mode 3: Strategic synthesis...", recipient=sender)
+        print('⋯ progress:', "Mode 3: Strategic synthesis...")
         m3_template = load_mode("mode3_synthesis.md")
         m3_prompt   = inject_focus(
             inject_prior_reports(
@@ -512,7 +507,7 @@ async def handle_analyze(session, sender, clean_text, rag_context, history):
     if "crosscheck" in resume_from:
         outputs["crosscheck"] = load_checkpoint(report_dir, "crosscheck")
     else:
-        await send_signal(session, "Crosscheck: Independent validation...", recipient=sender)
+        print('⋯ progress:', "Crosscheck: Independent validation...")
         outputs["crosscheck"] = await run_crosscheck_internal(
             session,
             f"Validate and critique this Mode 3 assessment of {full_name}:\n\n{outputs['mode3']}",
@@ -648,10 +643,9 @@ async def handle_crosscheck(session, sender, clean_text, rag_context, history):
         )
         clean_text = clean_text + context_hint
 
-    await send_signal(session,
-        "Crosscheck: Claude + Gemini independent assessment + arbitration. "
-        "~2-3 min. Reply !stop to cancel.",
-        recipient=sender)
+    from coordinator import working as _working
+    await _working()   # ⏳ instead of a progress message (One Voice A.2)
+    print('⋯ progress:', "Crosscheck: Claude + Gemini independent assessment + arbitration. " "~2-3 min. Reply !stop to cancel.")
 
     cancel_flags[sender] = False
     result = await run_crosscheck_internal(session, clean_text, web_results=True)

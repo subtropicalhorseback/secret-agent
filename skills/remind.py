@@ -397,7 +397,9 @@ async def handle_remind(session, sender, clean_text, rag_context, history):
     sender_phone = sender
 
     # Parse via Claude
-    await send_signal(session, "Parsing reminder...", recipient=sender)
+    from coordinator import working as _working
+    await _working()   # ⏳ instead of a progress message (One Voice A.2)
+    print('⋯ progress:', "Parsing reminder...")
     try:
         parsed = await parse_reminder(clean_text, sender_name, sender_phone)
     except Exception as e:

@@ -22,9 +22,21 @@
 #   protected        see above
 #   runner           "dispatcher" (default) or "cron" (stays in the crontab;
 #                    listed here for display only)
-#   timeout_seconds  default 300
+#   timeout_seconds  default 300; on expiry the job is hard killed and the run
+#                    is recorded as outcome "timeout", not "failed"
+#   max_failures     consecutive failures before one Signal alert (default 3).
+#                    Exactly one alert per failing streak — the job goes quiet
+#                    again until it next succeeds. Tune per job: a five-minute
+#                    job reaches 3 in a quarter of an hour, a nightly one takes
+#                    three days, so they do not want the same number.
 #   env              optional extra environment variables
 #   warn_on_disable  shown to the admin before the job is switched off
+#
+# ROLLBACK
+#   The original per-job crontab lines are kept, commented out, in the user
+#   crontab. To go back: `crontab -e`, uncomment them, and comment out the
+#   single dispatcher line. Nothing here needs changing — the dispatcher just
+#   stops being called. See README "Rolling back the job dispatcher".
 
 - name: signal_watchdog
   schedule: "*/5 * * * *"
@@ -49,6 +61,7 @@
   enabled: true
   protected: true
   timeout_seconds: 3600
+  max_failures: 1          # nightly: 3 in a row would be three days blind
 
 - name: vitals
   schedule: "*/5 * * * *"
@@ -73,6 +86,7 @@
   enabled: true
   protected: false
   timeout_seconds: 3600
+  max_failures: 2
   warn_on_disable: "Nightly vault classification, memory maintenance and buffer archiving stop."
 
 - name: rotate_exit
@@ -81,6 +95,7 @@
   log: data/logs/rotate_exit.log
   enabled: true
   protected: false
+  max_failures: 2          # every 4h
 
 - name: apt_upgrade
   schedule: "0 3 * * 0"
@@ -89,6 +104,7 @@
   enabled: true
   protected: false
   timeout_seconds: 3600
+  max_failures: 1          # weekly
   warn_on_disable: "Security updates stop landing until this is switched back on."
 
 - name: pip_report
@@ -98,3 +114,4 @@
   enabled: true
   protected: false
   timeout_seconds: 600
+  max_failures: 1          # monthly

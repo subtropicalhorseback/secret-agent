@@ -85,6 +85,12 @@ def persona(phone):
     return USERS_FULL.get(phone, {}).get("persona", "")
 
 
+def style(phone):
+    """Per-user communication preferences (how they write, what they want
+    back). Optional; injected into the cached prompt for that user only."""
+    return (USERS_FULL.get(phone, {}).get("style") or "").strip()
+
+
 def profile_focus(name):
     for u in USERS_FULL.values():
         if u.get("name", "").lower() == (name or "").lower():

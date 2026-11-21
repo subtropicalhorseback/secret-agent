@@ -2,6 +2,12 @@
 # backup.sh - Chip nightly backup
 # Backs up coordinator, skills, config, DBs, and logs to Syncthing folder
 # Keeps last 7 daily tarballs
+#
+# SOUL.md lives at agents/chip/SOUL.md, not the workspace root. It is listed
+# explicitly even though agents/ above already covers it: the duplicate costs
+# a few KB, and it means the backup fails loudly if the identity file ever
+# goes missing again rather than quietly shipping an archive without it.
+# (It was listed as $WORKSPACE/SOUL.md and failed every night 15-20 Nov 2026.)
 
 WORKSPACE="${CHIP_WORKSPACE:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
 BACKUP_DIR="$WORKSPACE/syncthing/running_backups"
@@ -19,7 +25,7 @@ tar -czf "$ARCHIVE" \
     "$WORKSPACE/agents/" \
     "$WORKSPACE/config/" \
     "$WORKSPACE/facts.md" \
-    "$WORKSPACE/SOUL.md" \
+    "$WORKSPACE/agents/chip/SOUL.md" \
     "$WORKSPACE/data/memory/" \
     "$WORKSPACE/data/reminders.json" \
     2>> "$LOG"

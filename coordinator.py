@@ -37,6 +37,14 @@ import os
 import re
 import json
 import asyncio
+import sys as _sys_alias
+# Run as a script (systemd: `python3 coordinator.py`), this module is
+# __main__, and every skill's `from coordinator import send_signal` used to
+# load a SECOND copy of it — its own per-recipient send locks, its own state.
+# Registering the running module under its own name first makes those imports
+# return this one (20 Nov 2026).
+if __name__ == "__main__":
+    _sys_alias.modules.setdefault("coordinator", _sys_alias.modules["__main__"])
 import aiohttp
 import sqlite3
 import numpy as np
@@ -132,6 +140,13 @@ TAGS = {
 
 RAG_THRESHOLD = 0.55
 
+
+def fail_line(what, e):
+    """One plain line for a failure the user should hear about. The exception
+    itself goes to the log, never to the phone (One Voice spec A.1)."""
+    print(f"⚠️ {what} failed: {type(e).__name__}: {e}")
+    return f"{what} failed ({type(e).__name__}). It's in the log."
+
 # Sent when a model returns no text at all (refusal, exhausted budget) so the
 # user never just gets "..." with no explanation.
 EMPTY_REPLY = ("I didn't get a usable answer back from the model on that one "
@@ -158,6 +173,7 @@ ADMIN_ONLY_CMDS = {
     "rechunk",                            # heavy, stops ingest
     "archive",
     "fix",                                # Claude Code self-heal (19 Nov 2026)
+    "build", "skill",                     # build track + add-on skill switches (20 Nov 2026)
     "browse", "mullvad",                  # live browser + VPN control (spec: the child user refused)
 }
 
@@ -242,6 +258,8 @@ COMMAND_MAP = {
     "effort":   ("builtin", "effort"),
     "think":    ("builtin", "effort"),
     "fix":      ("builtin", "fix"),
+    "build":    ("builtin", "build"),
+    "skill":    ("builtin", "skill"),
     "browse":   ("builtin", "browse"),
     "mullvad":  ("builtin", "mullvad"),
     "ls":       ("shell", "ls"),
@@ -337,19 +355,31 @@ Just ask (no prefix needed) — Chip can now do these itself in conversation:
 
 Browser (admin):
   browse: <task> [via home]    drive a real browser on live sites; up to
-                               15 min, results arrive when done. Watch or
-                               take over live (link sent at start); reply
-                               'resume' after a handoff. stop: cancels.
+                               15 min, one reply when done. If a site wants
+                               a human check you get the picture; just reply
+                               with what it says (or skip). stop: cancels.
+                               'via home' sends ONLY this browser session out
+                               the home IP (for retailers that block VPN
+                               ranges) — the rest of the box stays on Mullvad.
+                               Self-expires; 15 min hard cap; logged.
   mullvad: off [min] | on | status   whole-box VPN toggle (auto re-enables)
 
 Self-repair (admin):
-  fix: <problem description>   stage a Claude Code repair job
-  fix: approve | reject | status
+  fix: <problem description>   stage a repair (one problem, needs approval)
+  fix: supersedes FIX-0002: <new order>   replace a staged order
+  fix: continue FIX-0003: <note>   follow up in the same healer session
+  fix: status [FIX-0003]       the index, or one record in full
+  fix: approve [FIX-0003] [override] | reject [FIX-0003] | restore FIX-0003
+  build: <name>: <what it does>   stage a new skill (adds files only)
+  skill: list | off <name> | on <name>   add-on skills; off works at once
+  Every order gets a stable FIX-NNNN id and nothing is ever deleted —
+  reject and supersede are status changes, and a rejected order can be
+  restored. Jobs run one at a time; approving a second queues it.
   Runs detached with full repo access; results arrive here. Nothing
-  executes without the explicit approve.
+  executes without the explicit approve, which only a human can type.
 
 Scheduling (admin) — the line is ownership, not topic:
-  Just ask in plain language ("check the trough every morning at six",
+  Just ask in plain language ("check the mail every morning at six",
   "what runs automatically on this box").
   Chip's own jobs   it can list, create, retime, and switch off. A job
                     carries a note it acts on when it fires — never a
@@ -421,6 +451,10 @@ CAT_WHITELIST_DIRS = [
     f"{WORKSPACE}/skills/",
     f"{WORKSPACE}/data/archive/reports/",
     f"{WORKSPACE}/data/patches/",
+    # Browse run artifacts. Already inside reports/ for `cat:`, but read_file
+    # resolves a bare filename against each root, so listing the subdirectory
+    # is what lets Chip read an artifact by the name system_health gives it.
+    f"{WORKSPACE}/data/archive/reports/browse/",
 ]
 
 def _resolve_whitelisted(target):
@@ -453,16 +487,20 @@ def _resolve_whitelisted(target):
 
 hot_buffer = deque(maxlen=60)
 
-def log_to_buffer(sender, user_text, response):
+def log_to_buffer(sender, user_text, response, history_roles=("user", "assistant")):
     ts   = datetime.now().strftime("%H:%M")
     name = USERS.get(sender, {}).get("name", sender)
     # Persistent history store (survives the nightly wipe — audit M3).
     # Buffers below stay as-is: the dream-cycle archive reads them.
+    # history_roles: a deferred answer logged the user's turn when it deferred,
+    # so only Chip's turn is written here (One Voice spec B.2).
     try:
         import skills.history as history
-        history.log_turn(name.lower(), "user", user_text)
-        history.log_turn(name.lower(), "assistant",
-                         re.sub(r"^\[[^\]]+\]\s*", "", response or ""))
+        if "user" in history_roles:
+            history.log_turn(name.lower(), "user", user_text)
+        if "assistant" in history_roles:
+            history.log_turn(name.lower(), "assistant",
+                             re.sub(r"^\[[^\]]+\]\s*", "", response or ""))
     except Exception as e:
         print(f"⚠️ history write: {e}")
     hot_buffer.append(f"[{ts}] {name}: {user_text}")
@@ -579,8 +617,9 @@ Don't moralize. Don't apologize for knowing things.""",
 
 LENGTH_INSTRUCTIONS = {
     "default": (
-        "\nRESPONSE LENGTH: Concise. 2-4 sentences for facts, "
-        "1 short paragraph for general questions. Longer only when clearly needed."
+        "\nRESPONSE LENGTH: Answer the question; two or three sentences unless "
+        "more is asked for. No preamble, no recap, no narration of your own "
+        "process or tools."
     ),
     "verbose": "\nRESPONSE LENGTH: Comprehensive. Full detail, do not truncate.",
     "concise": "\nRESPONSE LENGTH: Maximum 2 sentences. Direct answer only.",
@@ -746,6 +785,12 @@ def load_context_blocks(sender, sections=None, rag_context=None, rag_facts=None,
     stable = "\n\n".join([load_soul(),
                           f"---\n{load_user_identity(sender)}",
                           FORMAT_INSTRUCTION])
+    # Per-user communication preferences (One Voice spec, Part E, 20 Nov
+    # 2026). Stable per sender, so it lives in the cached block.
+    _style = chip_config.style(sender)
+    if _style:
+        _sname = USERS.get(sender, {}).get("name", "this user").upper()
+        stable += f"\n\n---\nHOW TO TALK WITH {_sname} (overrides any general length guidance):\n{_style}"
     if USERS.get(sender, {}).get("tier") == "admin":
         # Self-knowledge pointer (19 Nov 2026): the dev notes Claude Code
         # keeps about Chip are readable via the read_session_notes tool.
@@ -767,6 +812,18 @@ def load_context_blocks(sender, sections=None, rag_context=None, rag_facts=None,
 
     _now = _dt.now().strftime("%A, %B %-d, %Y at %-I:%M %p CDT")
     vol = [f"Current date and time: {_now}"]
+    # Dated system status (20 Nov 2026): when Chip itself changes, earlier
+    # conversation about it goes stale, and the history window and rolling
+    # summary keep repeating it until they fold forward. A short, expiring
+    # status line in data/system_status.json corrects that for admins.
+    if sender == chip_config.ADMIN_PHONE:
+        try:
+            _st = json.load(open(f"{WORKSPACE}/data/system_status.json"))
+            if _dt.now().isoformat() < _st.get("until", ""):
+                vol.append("SYSTEM STATUS (authoritative; where earlier conversation "
+                           f"disagrees, this wins): {_st['text']}")
+        except Exception:
+            pass
     try:  # rolling summary of conversation older than the verbatim window
         import skills.history as _h
         _summ = _h.get_summary(USERS.get(sender, {}).get("name", "").lower())
@@ -1200,15 +1257,45 @@ async def route(session, text, sender):
 
 # ─── Markdown stripper ────────────────────────────────────────────────────────
 
+CODE_FENCE_RE = re.compile(r'```.*?(?:```|\Z)', re.DOTALL)
+
+
 def strip_markdown(text):
-    text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'_{1,3}(.*?)_{1,3}', r'\1', text, flags=re.DOTALL)
+    """Flatten markdown for Signal, which renders none of it.
+
+    Fenced blocks are pulled out before the emphasis passes and put back
+    after. They used to be deleted outright (`re.sub(r'```.*?```', '')`), so
+    any code Chip sent arrived as a hole in the message. The emphasis patterns
+    also ran with DOTALL, which meant two snake_case identifiers — or a stray
+    '*' used as multiplication — could pair up several paragraphs apart and
+    swallow everything between them. Both read to the user as a reply that
+    tailed off. Fences are kept so the splitter can see where code starts and
+    ends and avoid cutting through it.
+    """
+    vault = []
+
+    def _stash(value):
+        vault.append(value)
+        return f"\x00{len(vault) - 1}\x00"
+
+    text = CODE_FENCE_RE.sub(lambda m: _stash(m.group(0)), text)
+    # Inline code loses its backticks but keeps its content, and is protected
+    # from the emphasis passes for the same reason as a fenced block.
+    text = re.sub(r'`([^`\n]+)`', lambda m: _stash(m.group(1)), text)
+
+    # Line-bounded, and the delimiters must hug non-space, so emphasis can no
+    # longer reach across a paragraph. The underscore form additionally
+    # refuses to fire mid-identifier, which is what mangled snake_case.
+    text = re.sub(r'\*{1,3}([^*\s](?:[^*\n]*[^*\s])?)\*{1,3}', r'\1', text)
+    text = re.sub(r'(?<![A-Za-z0-9_])_{1,3}([^_\s](?:[^_\n]*[^_\s])?)_{1,3}(?![A-Za-z0-9_])',
+                  r'\1', text)
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-    text = re.sub(r'`([^`]+)`', r'\1', text)
     text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
     text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'\n{3,}', '\n\n', text)
+
+    for i, original in enumerate(vault):
+        text = text.replace(f"\x00{i}\x00", original)
     return text.strip()
 
 # ─── Cloud dispatch ───────────────────────────────────────────────────────────
@@ -1299,15 +1386,31 @@ TOOL_ROUND_CAP = 3
 
 async def ask_cloud(session, user_text, sender, tier="cloud_default",
                     rag_context=None, rag_facts=None, history=None,
-                    sections=None, length="default", fallback=False):
+                    sections=None, length="default", fallback=False,
+                    allowed_tools=None):
     model_name = MODELS.get(tier, MODELS["cloud_default"])
     tag        = _model_tag(model_name, fallback=fallback)
+    # allowed_tools (One Voice spec B.2): a result turn carries untrusted web
+    # text, so it gets a fixed read-only tool list. Enforced twice — the model
+    # only sees these tools, and execute_tool refuses anything else for the
+    # rest of this call (a contextvar, inherited by the parallel tool tasks).
+    _allow_tok = tool_calling.ALLOWED_TOOLS.set(
+        frozenset(allowed_tools) if allowed_tools is not None else None)
+    try:
+        return await _ask_cloud_inner(session, user_text, sender, tier, model_name, tag,
+                                      rag_context, rag_facts, history, sections, length)
+    finally:
+        tool_calling.ALLOWED_TOOLS.reset(_allow_tok)
+
+
+async def _ask_cloud_inner(session, user_text, sender, tier, model_name, tag,
+                           rag_context, rag_facts, history, sections, length):
     # `tier` above is the ROUTING tier (cloud_default/cloud_heavy). The
     # user's permission tier is separate, and decides which tools are even
     # visible — admin-only tools are withheld from non-admins' tool list
     # entirely, on top of the per-tool check inside execute_tool().
     user_tier  = USERS.get(sender, {}).get("tier", "user")
-    user_tools = tool_calling.tools_for(user_tier)
+    user_tools = tool_calling.tools_for(user_tier)   # honours ALLOWED_TOOLS
     _stable, _semi, _volatile = load_context_blocks(
         sender, sections=sections, rag_context=rag_context,
         rag_facts=rag_facts, length=length)
@@ -1531,7 +1634,7 @@ async def ask_cloud(session, user_text, sender, tier="cloud_default",
             if attempt < 2:
                 await asyncio.sleep(10)
             else:
-                return f"Cloud API failed: {e}", tag
+                return fail_line("The model call", e), tag
 
     return "Cloud API unavailable.", tag
 
@@ -1545,6 +1648,53 @@ SIGNAL_ATTACH_OVER = 2 * SIGNAL_MAX_CHARS    # longer than two messages -> file
 SIGNAL_MIN_TAIL    = 200                     # never send a runt final chunk
 
 _send_locks = {}
+_rpc_seq    = 0
+
+
+def _next_rpc_id():
+    """A distinct JSON-RPC id per request, so a reply can be matched to the
+    request that earned it (see _read_rpc_reply)."""
+    global _rpc_seq
+    _rpc_seq += 1
+    return _rpc_seq
+
+
+async def _read_rpc_reply(reader, want_id, timeout):
+    """Read until signal-cli's answer to OUR request, discarding anything else.
+
+    The daemon runs with the default receive mode, which broadcasts `receive`
+    notifications to EVERY connected client — including the short-lived
+    connection a send opens. So the first line back on this socket is often
+    an unrelated inbound message rather than the send's response.
+
+    Taking that first line as the reply is the send-buffer bug: a send was
+    reported delivered on the strength of someone else's inbound message,
+    and the rejection that arrived on the next line was never read. That
+    defeats the whole point of confirming each chunk before sending the next.
+
+    Returns the parsed response, or None when the line was unparseable
+    (unchanged from before: present but unreadable is treated as sent).
+    """
+    loop     = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        raw = await asyncio.wait_for(reader.readline(), timeout=remaining)
+        if not raw:
+            raise RuntimeError("signal-cli closed the connection without replying")
+        try:
+            msg = json.loads(raw.decode())
+        except Exception:
+            return None
+        if not isinstance(msg, dict):
+            return None
+        if msg.get("method"):                    # a notification, not an answer
+            continue
+        if "id" in msg and msg["id"] != want_id:
+            continue                             # an answer, but not to us
+        return msg
 
 
 def _recipient_lock(target):
@@ -1557,17 +1707,68 @@ def _recipient_lock(target):
     return lock
 
 
+def _protected_spans(text):
+    """(start, end) of every fenced code block — regions a cut must not land
+    inside. A code block arriving in two pieces is unreadable, and the second
+    piece reads as a new message rather than a continuation."""
+    return [m.span() for m in CODE_FENCE_RE.finditer(text)]
+
+
+def _respect_code_blocks(rest, cut, lo, budget):
+    """Move `cut` off the inside of a code block. Prefer closing before the
+    block starts; failing that, after it ends. A block too big to keep whole
+    is cut as-is — the caller has already decided this is a message, not a
+    file attachment."""
+    for start, end in _protected_spans(rest):
+        if not (start < cut < end):
+            continue
+        if start >= lo:                           # close the chunk before the fence
+            return start
+        if end <= budget:                         # or carry the whole block
+            return end
+        return cut                                # block alone exceeds a message
+    return cut
+
+
+def _rebalance_fences(chunks):
+    """Make every chunk independently well-formed with respect to code fences.
+
+    A fenced block longer than one Signal message has to be cut somewhere.
+    Cutting it plainly left chunk N ending on an unterminated ``` and chunk
+    N+1 opening with bare code, which on a handset reads as two broken
+    messages rather than one listing continued. Close the fence at the end of
+    the chunk that opened it and reopen it at the start of the next, so a
+    split block still arrives as code on both sides of the break.
+
+    The reopened fence carries no language hint: Signal renders no markdown
+    anyway, and guessing one would be a second thing to get wrong.
+    """
+    out, carry = [], ""
+    for chunk in chunks:
+        body = carry + chunk
+        if body.count("```") % 2:                # still open where this chunk ends
+            out.append(body + "\n```")
+            carry = "```\n"
+        else:
+            out.append(body)
+            carry = ""
+    return out
+
+
 def split_for_signal(text, max_chars=None, min_tail=None):
     """Split `text` into the fewest balanced chunks that each fit one Signal
     message, breaking at a paragraph, then a line, then a sentence, then a
-    space - never mid-word. The caller numbers chunks from len(result), so
-    the "(i/n)" marker can never disagree with what was sent."""
+    space - never mid-word, and never through a fenced code block. The caller
+    numbers chunks from len(result), so the "(i/n)" marker can never disagree
+    with what was sent."""
     max_chars = max_chars or SIGNAL_MAX_CHARS
     min_tail  = SIGNAL_MIN_TAIL if min_tail is None else min_tail
     text = text.strip()
     if len(text) <= max_chars:
         return [text]
     budget = max_chars - 10                      # room for the " (i/n)" marker
+    if "```" in text:
+        budget -= 8                              # room for _rebalance_fences to close and reopen
     n      = -(-len(text) // budget)
     chunks, rest = [], text
     while len(rest) > budget:
@@ -1586,6 +1787,9 @@ def split_for_signal(text, max_chars=None, min_tail=None):
                 break
         if cut <= 0:
             cut = budget                          # one unbroken token longer than a message
+        cut = _respect_code_blocks(rest, cut, lo, budget)
+        if cut <= 0 or cut > len(rest):
+            cut = min(budget, len(rest))          # never stall or overrun
         chunks.append(rest[:cut].rstrip())
         rest = rest[cut:].lstrip()
     if rest:
@@ -1593,18 +1797,50 @@ def split_for_signal(text, max_chars=None, min_tail=None):
             chunks[-1] = chunks[-1] + "\n\n" + rest      # fold a runt into its neighbour
         else:
             chunks.append(rest)
-    return chunks
+    return _rebalance_fences(chunks)
 
 
-async def send_signal(session, text, recipient=None):
-    """Send one message, serialized per recipient (see _recipient_lock)."""
+async def send_signal(session, text, recipient=None, kind=None):
+    """Send one message, serialized per recipient (see _recipient_lock).
+    Returns True if signal-cli confirmed it.
+
+    Every message passes the send gate first (skills/send_gate.py, One Voice
+    spec A.1): `kind` names what it is (reply, file, ask, scheduled, relay,
+    alert). Left as None, a message inside an open turn is that turn's reply."""
     target = recipient or SENDER
+    from skills import send_gate
+    ok, _k, _why = send_gate.decide(target, text, kind=kind)
+    if not ok:
+        return False
     async with _recipient_lock(target):
-        await _send_signal_raw(session, text, target)
+        return await _send_signal_raw(session, text, target)
+
+
+async def working():
+    """'Still working' without a message: ⏳ on the inbound message of the
+    turn this context belongs to. Replaces the old progress pings ("Processing
+    PDF...", "Rechunking..."); the worker swaps it for ✅ at the end."""
+    try:
+        from skills import send_gate
+        t = send_gate.raw()
+        if t is not None and t.ts and t.ts != "0" and not t.reacted:
+            t.reacted = True
+            await send_reaction(t.sender, t.ts, "⏳")
+    except Exception as e:
+        print(f"⚠️ working(): {e}")
 
 
 async def _send_signal_raw(session, text, target):
-    """The actual send. Callers must hold the recipient's lock."""
+    """The actual send. Callers must hold the recipient's lock.
+
+    Returns True only when signal-cli answered THIS request without an error.
+    The reply line used to be read and thrown away, so a send signal-cli had
+    rejected was still logged and printed as 'delivered'. Reading it was not
+    enough on its own: the daemon broadcasts inbound-message notifications
+    down this socket too, so the first line back is frequently not the answer
+    to our send. The request now carries its own id and the reply is matched
+    to it — see _read_rpc_reply.
+    """
     # If this user's last inbound came over Discord, reply there instead
     # (connector scaffold, 19 Nov 2026 — no-ops until the relay is set up).
     try:
@@ -1612,26 +1848,35 @@ async def _send_signal_raw(session, text, target):
         if _dr.PREFER.get(target) == "discord" and await _dr.deliver(target, text):
             call_logger.log_signal_out(target[-4:], status="discord")
             print(f"🎮 → {target[-4:]}: {text[:80]}")
-            return
+            return True
     except Exception:
         pass
     try:
+        req_id = _next_rpc_id()
         req = json.dumps({
-            "jsonrpc": "2.0", "method": "send", "id": 1,
+            "jsonrpc": "2.0", "method": "send", "id": req_id,
             "params": {"recipient": [target], "message": text}
         }) + "\n"
         reader, writer = await asyncio.open_unix_connection(SIGNAL_SOCKET)
         writer.write(req.encode())
-        await writer.drain()
-        await asyncio.wait_for(reader.readline(), timeout=15)
+        await writer.drain()                     # the whole request, however long
+        reply = await _read_rpc_reply(reader, req_id, timeout=15)
         writer.close()
         try: await writer.wait_closed()
         except Exception: pass
+
+        err = (reply or {}).get("error")
+        if err:
+            detail = err.get("message", err) if isinstance(err, dict) else err
+            raise RuntimeError(f"signal-cli rejected the send: {detail}")
+
         call_logger.log_signal_out(target[-4:], status="delivered")
         print(f"📤 → {target[-4:]}: {text[:80]}")
+        return True
     except Exception as e:
         call_logger.log_signal_out(target[-4:], status=f"error:{e}")
         print(f"❌ Send error: {e}")
+        return False
 
 async def _signal_rpc(method, params):
     """Fire-and-forget JSON-RPC to signal-cli. Never raises — these are UX
@@ -1673,12 +1918,42 @@ async def send_reaction(recipient, target_ts, emoji, remove=False):
     })
 
 
-async def send_signal_file(session, filepath, caption, recipient=None):
+async def send_signal_file(session, filepath, caption, recipient=None, kind=None,
+                           _gated=False):
+    """Send one file as an attachment, and find out whether it arrived.
+
+    Until 20 Nov 2026 this path wrote its request, read one line, and threw it
+    away — so every file and document send was unconfirmed while text sends
+    were confirmed. Reading that line naively would not have been enough: the
+    daemon's default receive mode broadcasts inbound notifications to every
+    connected client, including the socket this send opens, so the first line
+    back is frequently someone else's mail. That is the same send-buffer bug
+    fixed for text in 78d95a5, and the same cure applies — the request carries
+    its own id and _read_rpc_reply skips to the answer that matches it.
+
+    Returns True when signal-cli answered THIS request without an error,
+    False when it rejected it or the connection failed, and None when no
+    answer arrived in time: unknown delivery, never success.
+
+    Locking is deliberately left to the caller, exactly as before
+    (deliver_response holds the recipient's lock across a report delivery);
+    taking the same non-reentrant lock here would deadlock that path.
+    """
     target   = recipient or SENDER
     filename = os.path.basename(filepath)
+    if not _gated:
+        # Through the send gate like every other message. An attachment is
+        # `file` unless the caller says otherwise (deliver_response's
+        # long-reply attachment is the reply itself and gates on its own).
+        from skills import send_gate
+        ok, _k, _why = send_gate.decide(target, f"[file] {filename} {caption or ''}",
+                                        kind=kind or "file")
+        if not ok:
+            return False
     try:
+        req_id = _next_rpc_id()
         req = json.dumps({
-            "jsonrpc": "2.0", "method": "send", "id": 1,
+            "jsonrpc": "2.0", "method": "send", "id": req_id,
             "params": {
                 "recipient":   [target],
                 "message":     caption,
@@ -1688,21 +1963,47 @@ async def send_signal_file(session, filepath, caption, recipient=None):
         reader, writer = await asyncio.open_unix_connection(SIGNAL_SOCKET)
         writer.write(req.encode())
         await writer.drain()
-        await asyncio.wait_for(reader.readline(), timeout=30)
-        writer.close()
-        try: await writer.wait_closed()
-        except Exception: pass
+        try:
+            reply = await _read_rpc_reply(reader, req_id, timeout=30)
+        finally:
+            writer.close()
+            try: await writer.wait_closed()
+            except Exception: pass
+
+        err = (reply or {}).get("error")
+        if err:
+            detail = err.get("message", err) if isinstance(err, dict) else err
+            raise RuntimeError(f"signal-cli rejected the attachment: {detail}")
+
+        call_logger.log_signal_out(target[-4:], status="delivered")
         print(f"📎 {filename} → {target[-4:]}")
+        return True
+    except asyncio.TimeoutError:
+        # No answer inside the window. The send may or may not have gone out,
+        # so say so rather than claiming either outcome.
+        call_logger.log_signal_out(target[-4:], status="unknown:no reply")
+        print(f"⚠️ {filename} → {target[-4:]}: no reply from signal-cli, delivery unknown")
+        return None
     except Exception as e:
+        call_logger.log_signal_out(target[-4:], status=f"error:{e}")
         print(f"❌ File send error: {e}")
+        return False
 
 async def deliver_response(session, text, sender, tag=None,
-                            force_file=False, cc_sender=None):
+                            force_file=False, cc_sender=None, kind=None):
     """Deliver one reply as ONE decision: a single message when it fits, the
     fewest balanced chunks when it does not, a file when it is longer than
     two messages. The recipient's lock is held across the whole delivery so
-    another turn's messages cannot land in the middle of this one."""
+    another turn's messages cannot land in the middle of this one.
+
+    One gate decision covers the whole reply, chunks included. Short notes
+    the turn collected (a staging id, 'effort back to high') are folded onto
+    the end of it rather than sent as messages of their own."""
+    from skills import send_gate
     text       = strip_markdown(text)
+    _notes     = send_gate.take_notes()
+    if _notes:
+        text = text.rstrip() + "\n\n" + "\n".join(_notes)
     tag_prefix = f"{tag} " if tag else ""
     full_text  = f"{tag_prefix}{text}"
     cc         = cc_sender if (cc_sender and cc_sender != sender) else None
@@ -1714,20 +2015,67 @@ async def deliver_response(session, text, sender, tag=None,
         filepath = f"{REPORT_DIR}/{ts}_{name}.txt"
         with open(filepath, "w") as f:
             f.write(full_text)
+        ok, _k, _why = send_gate.decide(sender, full_text, kind=kind)
+        if not ok:
+            return
         async with _recipient_lock(sender):
-            await send_signal_file(session, filepath, f"{tag_prefix}Report attached", sender)
+            await send_signal_file(session, filepath, f"{tag_prefix}Report attached",
+                                   sender, _gated=True)
         if cc:
-            await send_signal_file(session, filepath, "Copy of what was sent:", cc)
+            ok, _k, _why = send_gate.decide(cc, full_text)
+            if ok:
+                await send_signal_file(session, filepath, "Copy of what was sent:", cc,
+                                       _gated=True)
         return
 
     chunks = split_for_signal(full_text)
     total  = len(chunks)
+    sent   = 0
+    ok, _k, _why = send_gate.decide(sender, full_text, kind=kind, parts=total)
+    if not ok:
+        return
+    if total > 1:
+        # Logged so the real frequency of chunking is measurable rather than
+        # anecdotal: how long the reply was, and how many messages it became.
+        print(f"✂️  {len(full_text)} chars → {total} chunks for {sender[-4:]}")
+        call_logger.log_signal_out(sender[-4:],
+                                   status=f"chunked:{total}:{len(full_text)}chars")
     async with _recipient_lock(sender):
         for i, chunk in enumerate(chunks, 1):
             marker = f" ({i}/{total})" if total > 1 else ""
-            await _send_signal_raw(session, chunk + marker, sender)
+            # Confirmation of each before the next: stop on the first failure
+            # instead of firing the rest into a broken socket, so the gap is
+            # one reported break rather than a reply with a hole in it.
+            if not await _send_signal_raw(session, chunk + marker, sender):
+                print(f"❌ chunk {i}/{total} failed for {sender[-4:]} — "
+                      f"aborting the remaining {total - i}")
+                break
+            sent = i
+    if sent < total:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name     = USERS.get(sender, {}).get("name", "user").lower()
+        filepath = f"{REPORT_DIR}/{ts}_{name}_undelivered.txt"
+        with open(filepath, "w") as f:
+            f.write(full_text)
+        print(f"💾 undelivered remainder saved: {filepath}")
+        async with _recipient_lock(sender):
+            await _send_signal_raw(
+                session,
+                f"[delivery failed after part {sent} of {total} — "
+                f"the full reply is saved as {os.path.basename(filepath)}]",
+                sender)
     if cc:
-        await send_signal(session, f"Sent:\n{full_text[:SIGNAL_MAX_CHARS - 10]}", recipient=cc)
+        # The copy is chunked too. It used to be sliced to one message, which
+        # silently dropped the tail of anything longer. One gate decision for
+        # the whole copy, like the reply itself.
+        _parts = split_for_signal(f"Sent:\n{full_text}")
+        ok, _k, _why = send_gate.decide(cc, full_text, parts=len(_parts))
+        if ok:
+            async with _recipient_lock(cc):
+                for part in _parts:
+                    if not await _send_signal_raw(session, part, cc):
+                        break
 
 # ─── Command parser ───────────────────────────────────────────────────────────
 
@@ -1953,7 +2301,7 @@ async def handle_shell(session, sender, cmd, payload=""):
                 await send_signal(session, f"{tag}\n{content}", recipient=sender)
             return content
         except Exception as e:
-            await send_signal(session, f"{tag} Read error: {e}", recipient=sender)
+            await send_signal(session, f"{tag} " + fail_line("Reading that file", e), recipient=sender)
             return ""
 
     if cmd == "facts":
@@ -2200,7 +2548,7 @@ async def process_pdf_upload(session, sender, save_path, raw_filename,
                         first_page = extracted
     except Exception as e:
         _publish(raw_filename)
-        return f"PDF saved as {raw_filename} — extraction failed: {e}"
+        return f"PDF saved as {raw_filename}, but " + fail_line("text extraction", e)
 
     if not pdf_text.strip():
         _publish(raw_filename)
@@ -2285,7 +2633,7 @@ async def process_pdf_upload(session, sender, save_path, raw_filename,
         chunks = ingest_text(pdf_text, new_filename, domain=domain, source_type="signal")
     except Exception as e:
         _publish(new_filename)
-        return f"Saved as {new_filename} but ingest failed: {e}"
+        return f"Saved as {new_filename}, but " + fail_line("indexing it", e)
 
     # Record the file hash so pdf_watcher recognises this document as already
     # ingested, THEN move the file into place under its final name.
@@ -2459,7 +2807,7 @@ async def handle_memory(session, sender, args):
 
     # Rebuild profile (admin identity synthesis)
     if "rebuild profile" in args_lower or "rebuild" in args_lower:
-        await send_signal(session, f"Rebuilding {chip_config.ADMIN_NAME.lower()}.md — 30s...", recipient=sender)
+        await working()   # ⏳ instead of a "Rebuilding…" message
         try:
             import anthropic as _anth
             conn = sqlite3.connect(CONTEXT_DB)
@@ -2504,7 +2852,7 @@ async def handle_memory(session, sender, args):
                 f"{tag} {chip_config.ADMIN_NAME.lower()}.md rebuilt from {len(active_facts)} active facts.",
                 recipient=sender)
         except Exception as e:
-            await send_signal(session, f"{tag} Rebuild failed: {e}", recipient=sender)
+            await send_signal(session, f"{tag} " + fail_line("The rebuild", e), recipient=sender)
         return
 
     # Natural language update/supersede/archive — ask Claude to interpret
@@ -2564,7 +2912,7 @@ async def handle_memory(session, sender, args):
         await send_signal(session, "\n".join(lines), recipient=sender)
 
     except Exception as e:
-        await send_signal(session, f"{tag} Memory update failed: {e}", recipient=sender)
+        await send_signal(session, f"{tag} " + fail_line("The memory update", e), recipient=sender)
 
 
 async def handle_rechunk(session, sender, args):
@@ -2626,7 +2974,7 @@ async def handle_rechunk(session, sender, args):
     conn.commit()
     conn.close()
 
-    await send_signal(session, f"Rechunking {filename}...", recipient=sender)
+    await working()   # ⏳ instead of a "Rechunking…" message
 
     try:
         from skills.vault_ingest import ingest_text
@@ -2660,7 +3008,7 @@ async def handle_rechunk(session, sender, args):
             f"{tag} {filename} rechunked: {chunks} chunks, domain={domain}",
             recipient=sender)
     except Exception as e:
-        await send_signal(session, f"{tag} Rechunk failed: {e}", recipient=sender)
+        await send_signal(session, f"{tag} " + fail_line("The rechunk", e), recipient=sender)
 
 
 async def handle_voice(session, sender, args):
@@ -2875,7 +3223,7 @@ async def handle_archive(session, sender, args):
             tag    = TAGS["chip"]
         await deliver_response(session, answer, sender, tag=tag)
     except Exception as e:
-        await deliver_response(session, f"Archive error: {e}", sender, tag=TAGS["chip"])
+        await deliver_response(session, fail_line("The archive", e), sender, tag=TAGS["chip"])
 
 # ─── Media dispatch ───────────────────────────────────────────────────────────
 
@@ -2890,8 +3238,25 @@ async def media_dispatch_batch(session, sender, text, attachments, ts):
     history    = load_history(sender, USERS.get(sender, {}).get("history", 30))
     system     = load_context(sender, sections=[], length="default")
 
+    # What the user actually typed, for any PDFs in this batch. media_dispatch
+    # does this for a single attachment; here the prefixes were never parsed at
+    # all, so "recipes: add these" sent with two PDFs lost both the caption and
+    # the domain and came back as two bare ingest receipts.
+    _batch_raw   = (text or "").strip()
+    _mpfx_m      = re.match(r'^(s|o|g|gp)\s*:\s*(.*)', _batch_raw, re.IGNORECASE | re.DOTALL)
+    _mpfx        = _mpfx_m.group(1).lower() if _mpfx_m else None
+    _batch_rest  = _mpfx_m.group(2).strip() if _mpfx_m else _batch_raw
+    pdf_tier     = {"s": "cloud_heavy", "o": "cloud_opus", "g": "cloud_default",
+                    "gp": "cloud_top"}.get(
+                        _mpfx, USERS.get(sender, {}).get("default_model", "cloud_default"))
+    _dom_m       = re.match(r'^(' + chip_config.PREFIX_DOMAIN_REGEX + r')\s*:\s*(.*)',
+                            _batch_rest, re.IGNORECASE)
+    pdf_domain   = _dom_m.group(1).lower() if _dom_m else "unclassified"
+    pdf_caption  = _dom_m.group(2).strip() if _dom_m else _batch_rest
+
     image_parts  = []
     other_results = []
+    pdf_docs      = []            # (published name, extracted text) for the caption call
     save_dir     = f"{SYNCTHING_DIR}/media"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -2918,9 +3283,18 @@ async def media_dispatch_batch(session, sender, text, attachments, ts):
             continue
 
         if content_type == "application/pdf":
-            await send_signal(session, "Processing PDF...", recipient=sender)
-            result = await process_pdf_upload(session, sender, save_path, filename)
-            other_results.append(result)
+            await working()   # ⏳ instead of a "Processing PDF…" message
+            _info  = {}
+            result = await process_pdf_upload(session, sender, save_path, filename,
+                                              domain=pdf_domain, info=_info)
+            # With a caption, the ingest receipt is not the answer — hold the
+            # document back and let the chat model reply to it below. Without
+            # one, or when nothing could be extracted, the receipt is all there
+            # is to say, exactly as before.
+            if pdf_caption and _info.get("text"):
+                pdf_docs.append((_info.get("filename", filename), _info["text"]))
+            else:
+                other_results.append(result)
         elif content_type.startswith("audio/"):
             from skills.audio_id import handle_audio_attachment
             other_results.append(handle_audio_attachment(sender, save_path, content_type))
@@ -2933,6 +3307,32 @@ async def media_dispatch_batch(session, sender, text, attachments, ts):
     # Send non-image results first
     for r in other_results:
         await deliver_response(session, r, sender, tag=TAGS["chip"])
+
+    # One answer covering every captioned PDF in the message. They arrived
+    # together under one instruction ("which of these is cheaper?"), so they
+    # are asked about together; answering each in isolation cannot compare
+    # them. The 60k character budget is the single-PDF limit, shared out.
+    if pdf_docs:
+        per_doc  = max(2000, 60000 // len(pdf_docs))
+        sections = []
+        for _name, _doc in pdf_docs:
+            _cut = "" if len(_doc) <= per_doc else f"\n[{_name} truncated at {per_doc:,} characters]"
+            sections.append(f"--- {_name} ---\n{_doc[:per_doc]}{_cut}")
+        _count  = ("a PDF" if len(pdf_docs) == 1
+                   else f"{len(pdf_docs)} PDFs")
+        _prompt = (f"{pdf_caption}\n\n[The user attached {_count} with this message. "
+                   f"They are saved and indexed under the names shown below. "
+                   f"The full text of each follows.]\n\n" + "\n\n".join(sections))
+        _saved  = ", ".join(n for n, _ in pdf_docs)
+        try:
+            reply, rtag = await ask_cloud(session, _prompt, sender, tier=pdf_tier,
+                                          history=history)
+            await deliver_response(session, f"(Saved as {_saved})\n\n{reply}", sender, tag=rtag)
+            log_to_buffer(sender, f"[pdf {_saved}] {pdf_caption}", reply)
+        except Exception as e:
+            # The documents are already ingested; say so rather than losing them.
+            await deliver_response(session, f"Saved as {_saved}, but " + fail_line("the reply", e),
+                                   sender, tag=TAGS["chip"])
 
     if not image_parts:
         return
@@ -2976,7 +3376,7 @@ async def media_dispatch_batch(session, sender, text, attachments, ts):
                                    user_text=clean_text, response_text=answer, source="vision")
 
     except Exception as e:
-        await deliver_response(session, f"Batch media error: {e}", sender, tag=TAGS["chip"])
+        await deliver_response(session, fail_line("Handling those attachments", e), sender, tag=TAGS["chip"])
 
 
 async def media_dispatch(session, sender, text, attachment, ts):
@@ -3075,7 +3475,7 @@ async def media_dispatch(session, sender, text, attachment, ts):
                                          domain=pdf_domain, source_type="signal")
                     answer = f"Text ingested: {filename} ({chunks} chunks)"
                 except Exception as e:
-                    answer = f"Text ingest error: {e}"
+                    answer = fail_line("Indexing that text", e)
                 await deliver_response(session, answer, sender, tag=TAGS["chip"])
                 log_to_buffer(sender, f"[text] {filename}", answer)
                 return
@@ -3277,7 +3677,7 @@ async def media_dispatch(session, sender, text, attachment, ts):
             asyncio.create_task(_background_image_ingest())
 
     except Exception as e:
-        await deliver_response(session, f"Media error: {e}", sender, tag=TAGS["chip"])
+        await deliver_response(session, fail_line("Handling that attachment", e), sender, tag=TAGS["chip"])
 
 # ─── Semantic dispatch ────────────────────────────────────────────────────────
 
@@ -3356,6 +3756,139 @@ def get_help_text(sender):
 
 message_queue = asyncio.Queue()
 
+# ─── Result turns (One Voice spec B.2, 20 Nov 2026) ──────────────────────────
+# When a turn hands work to workers (a browser run, research, analysis), the
+# turn sends nothing: ⏳ stays on the user's message and the turn is DEFERRED.
+# answer_deferred waits for every worker that turn started, then runs ONE
+# result turn — through the normal chat path, so the model and its client
+# always match (the 19:27 404 cannot recur as a class) — and sends the one
+# reply. The result turn may send work back out once or twice (code-capped)
+# instead of answering; then it waits again.
+#
+# Untrusted content: worker output is web-derived. It is fenced and labelled
+# (browse_bus.fence), and the result turn runs with a fixed read-only tool
+# list (tool_calling.RESULT_TURN_TOOLS) enforced by code.
+#
+# History: the user's message was logged when the turn deferred; Chip's answer
+# is logged as Chip's turn when it is sent. The raw worker report never enters
+# the conversation history — it is in the work log and the ledger.
+
+def _result_turn_prompt(turn, draft, results, followups_left):
+    from skills import browse_bus
+    name = USERS.get(turn.sender, {}).get("name", "the user")
+    L = ["[RESULT TURN — this is not a message from the user]",
+         f"Work you started for {name}'s message has come back. Write the ONE "
+         f"reply to that message now. It is the only thing {name} receives about it.",
+         "",
+         f'THEIR MESSAGE: "{turn.text.strip()[:2000]}"']
+    if draft and draft.strip() and draft.strip() != EMPTY_REPLY:
+        L += ["", "What you wrote when you started the work (never sent; it may "
+                  "cover other parts of their message):", draft.strip()[:1500]]
+    L += ["", f"RESULTS ({len(results)}):"]
+    for r in results:
+        files = [os.path.basename(f) for f in (r.get("files") or [])]
+        L.append(f"--- {r['id']} · {r['kind']} · status {r['status']} · task: "
+                 f"{(r.get('task') or '')[:300]}")
+        body = (r.get("result") or "(no result recorded)")[:12000]
+        L.append(browse_bus.fence(body, r["id"],
+                                  kind="stall" if r["status"] in ("stalled", "lost") else "terminus"))
+        if files:
+            L.append(f"files: {', '.join(files)}")
+    L += ["",
+          "How to answer:",
+          "- Answer their message directly, in your usual voice and length. Lead with the answer.",
+          "- Use only what the results show. Name the source page or site for every figure. "
+          "If a site blocked or failed, say so in a clause.",
+          "- Never paste a report and never describe workers, tools, routes, steps or "
+          "retries unless something failed and they need to know.",
+          "- Do not comment on how this result reached you, on routing or delivery, or "
+          "on whether the pipeline is working — even if earlier conversation was about "
+          "that. Answer the message and stop.",
+          "- Full report files (.txt) are attached to your reply automatically; don't "
+          "list file names. Screenshots listed under files are NOT sent unless you "
+          "call attach_file with the name — do that when the user asked for a "
+          "picture or one makes the answer clearer, and only then say it's attached.",
+          (f"- If the results don't answer it and a specific further attempt could, call "
+           f"instruct_worker ({followups_left} left for this request); your text is then "
+           f"not sent. Otherwise say plainly what's missing."
+           if followups_left > 0 else
+           "- No further attempts are available for this request: answer with what you "
+           "have and say plainly what's missing."),
+          "- If the answer includes a price, a share quote or a due date, call "
+          "record_observation once per figure with its source page, so it can be "
+          "answered from file later.",
+          "- You may check state with the read-only tools before answering."]
+    return "\n".join(L)
+
+
+async def answer_deferred(session, turn, draft=""):
+    """Wait for a deferred turn's workers, run the result turn, send the one
+    reply. Runs as its own task; adopts the original turn so the send gate
+    counts this as that message's reply."""
+    from skills import send_gate, workers, ledger, worklog
+    import skills.history as _hist
+    tok = send_gate.adopt(turn)
+    owner = turn.sender
+    name = USERS.get(owner, {}).get("name", owner)
+    call_logger.set_trace(call_logger.new_trace_id(), name)
+    answer, tag, files = "", TAGS["chip"], []
+    try:
+        tier = get_sticky_tier(owner) or USERS.get(owner, {}).get("default_model", "cloud_default")
+        for _round in range(1 + ledger.MAX_FOLLOWUPS):
+            wids, turn.workers = list(turn.workers), []
+            if not wids:
+                break
+            results = await workers.join(wids)
+            for r in results:
+                files += [f for f in (r.get("files") or [])
+                          if f.endswith(".txt") and os.path.exists(f)]
+            left = ledger.MAX_FOLLOWUPS - ledger.followups_used(turn.request_id)
+            prompt = _result_turn_prompt(turn, draft, results, left)
+            worklog.log("result_turn", turn=turn.id, request=turn.request_id,
+                        workers=[r["id"] for r in results],
+                        statuses=[r["status"] for r in results])
+            history = load_history(owner, USERS.get(owner, {}).get("history", 30))
+            if history and history[-1]["role"] == "user":
+                history = history[:-1]        # the prompt quotes it
+            answer, tag = await ask_cloud(
+                session, prompt, owner, tier=tier, history=history, sections=[],
+                length="default", allowed_tools=tool_calling.RESULT_TURN_TOOLS)
+            if turn.workers:                  # it sent work back out
+                draft = answer
+                continue
+            break
+        if not answer or answer == EMPTY_REPLY:
+            answer = ("I couldn't put an answer together from what came back. "
+                      "The run records are saved if you want me to look again.")
+        await deliver_response(session, answer, owner, tag=tag)
+        for f in files[:2]:
+            await send_signal_file(session, f, f"{TAGS['chip']} Full report", owner)
+        for f in (turn.attachments or [])[:3]:
+            # Pictures the result turn chose to send (attach_file), checked by
+            # code to be files this request's workers produced.
+            await send_signal_file(session, f, "", owner)
+        log_to_buffer(owner, turn.text, answer, history_roles=("assistant",))
+        asyncio.create_task(maybe_extract_facts(owner, turn.text, answer))
+        _tname = name.lower()
+        taxonomy.enqueue_work(kind="tag_extract", sender=owner, name=_tname,
+                              user_text=turn.text, response_text=answer, source="text")
+        asyncio.create_task(asyncio.to_thread(_hist.maybe_summarize, _tname))
+        if turn.ts:
+            await send_reaction(owner, turn.ts, "✅")
+    except Exception as e:
+        print(f"⚠️ deferred answer failed: {e}")
+        import traceback; traceback.print_exc()
+        await send_signal(session, f"{TAGS['chip']} " + fail_line("Putting that answer together", e),
+                          recipient=owner)
+        if turn.ts:
+            await send_reaction(owner, turn.ts, "❌")
+    finally:
+        try:
+            send_gate._turn.reset(tok)
+        except Exception:
+            pass
+
+
 async def worker(session):
     print("👷 Worker online.")
     while True:
@@ -3368,8 +3901,14 @@ async def worker(session):
         call_logger.set_trace(call_logger.new_trace_id(), name)
         call_logger.log_signal_in()
         print(f"🧠 [{name}] {text[:60]}")
+        # One in, one out: everything this message causes to be sent is
+        # attributed to this turn by the send gate (skills/send_gate.py).
+        from skills import send_gate as _gate
+        _gate_tok = _gate.begin(sender, ts, internal=packet.get("internal"),
+                                text=text)
         asyncio.create_task(send_typing(sender))  # phone shows life immediately
         _reacted = False
+        _notices_folded = False
 
         try:
             # VPN fail-closed override (audit Phase 0 step 6). Admin-only, and
@@ -3386,18 +3925,21 @@ async def worker(session):
                 message_queue.task_done()
                 continue
 
-            # Browser handoff return — 'resume' unblocks a paused browse
-            # session (spec: the admin finishes logins/CAPTCHAs over noVNC).
-            if text.strip().lower() == "resume":
-                if USERS.get(sender, {}).get("tier") == "admin":
-                    os.makedirs("/run/chip", exist_ok=True)
-                    open("/run/chip/browse_resume", "w").write(datetime.now().isoformat())
-                    await send_signal(session, f"{TAGS['chip']} Resuming the browser.",
+            # A worker is waiting on this person (a CAPTCHA picture, a login
+            # decision — One Voice spec C.8). Chip decides whether this
+            # message is the answer: if it is, it goes to the waiting worker
+            # and Chip says so in one line; if not, it is handled normally and
+            # the worker keeps waiting. (Replaces the noVNC 'resume' flow.)
+            if not packet.get("internal"):
+                from skills import asks as _asks
+                _ask = _asks.pending(sender)
+                if _ask is not None and await _ask_answer(_ask, text):
+                    _asks.answer(sender, text.strip())
+                    await send_signal(session, f"{TAGS['chip']} Got it — entering that now.",
                                       recipient=sender)
-                else:
-                    await send_signal(session, "⛔ Admin only.", recipient=sender)
-                message_queue.task_done()
-                continue
+                    log_to_buffer(sender, text, "[answer passed to the waiting browser task]")
+                    message_queue.task_done()
+                    continue
 
             # Plain-language effort control (the admin, 19 Nov 2026):
             # "think hard: <q>" → max for this turn + 5 sticky turns;
@@ -3428,7 +3970,7 @@ async def worker(session):
             if text is None:
                 continue
 
-            # Multi-attachment batch (e.g. 3 hay photos sent together)
+            # Multi-attachment batch (e.g. 3 photos sent together)
             attachments_batch = packet.get("attachments")
             if attachments_batch:
                 await media_dispatch_batch(session, sender, text, attachments_batch, ts)
@@ -3449,7 +3991,7 @@ async def worker(session):
                     await deliver_response(session, answer, sender,
                                            tag=TAGS["cloud_vision"], force_file=force_file)
                 except Exception as e:
-                    await deliver_response(session, f"Audio error: {e}", sender, tag=TAGS["chip"])
+                    await deliver_response(session, fail_line("The audio step", e), sender, tag=TAGS["chip"])
                 log_to_buffer(sender, text, "")
                 message_queue.task_done()
                 continue
@@ -3550,7 +4092,7 @@ async def worker(session):
                                 data   = await resp.json(content_type=None)
                                 answer = data.get("response", "").strip() or "[No response]"
                         except Exception as e:
-                            answer = f"Local model error: {e}"
+                            answer = fail_line("The local model", e)
                         pipeline_context = answer
                         final_answer     = answer
                         final_tag        = TAGS["local"]
@@ -3623,7 +4165,7 @@ async def worker(session):
                             delivered_inline = True
                             break
                     except Exception as e:
-                        final_answer = f"Skill error: {e}"
+                        final_answer = fail_line("That skill", e)
                         final_tag    = TAGS["chip"]
                     continue
 
@@ -3637,37 +4179,30 @@ async def worker(session):
                         from skills import browse as _browse
                         _task = (payload or "").strip()
                         _via  = None
-                        _m = re.search(r"\s+via\s+(mullvad|home)\s*$", _task, re.I)
+                        _m = re.search(r"\s+via\s+(mullvad|vpn|home)\s*$", _task, re.I)
                         if _m:
                             _via, _task = _m.group(1).lower(), _task[:_m.start()].strip()
                         if not _task:
                             await send_signal(session,
-                                f"{TAGS['chip']} Usage: browse: <task> [via mullvad|home]",
+                                f"{TAGS['chip']} Usage: browse: <task> [via vpn|home]",
                                 recipient=sender)
                         else:
-                            if _via == "home" and not os.path.exists("/run/chip/mullvad_off"):
+                            # 'via home' exposes the residential IP for this one
+                            # session (scoped — the rest of the box stays on
+                            # Mullvad). It no longer needs a whole-box
+                            # 'mullvad: off', but it is admin-only: the audit
+                            # trail has to name someone accountable.
+                            if _via == "home" and USERS.get(sender, {}).get("tier") != "admin":
                                 await send_signal(session,
-                                    f"{TAGS['chip']} Home routing needs 'mullvad: off' "
-                                    f"first (whole-box routing).", recipient=sender)
-                            else:
-                                async def _browse_bg(task=_task, via=_via, snd=sender):
-                                    try:
-                                        res, rt = await _browse.browse_session(
-                                            session, snd, task, via=via,
-                                            send_signal=send_signal,
-                                            cancel_flags=cancel_flags)
-                                        await deliver_response(
-                                            session, f"{res}\n\n[{rt}]", snd,
-                                            tag=TAGS["cloud_heavy"])
-                                    except Exception as e:
-                                        await send_signal(session,
-                                            f"{TAGS['chip']} Browse failed: {e}",
-                                            recipient=snd)
-                                asyncio.create_task(_browse_bg())
-                                await send_signal(session,
-                                    f"{TAGS['chip']} 🌐 Browsing: {_task[:80]} — "
-                                    f"watch live: {_browse.service_request({'op':'status'},10).get('novnc','')}",
+                                    f"{TAGS['chip']} Home routing is admin-only.",
                                     recipient=sender)
+                            else:
+                                # A worker like any other (One Voice spec B):
+                                # the turn defers below and the result turn
+                                # sends the one reply.
+                                from skills import workers as _workers
+                                _workers.launch(session, "browse", _task,
+                                                via=_via)
                         delivered_inline = True
                         break
                     elif bn == "mullvad":
@@ -3709,19 +4244,91 @@ async def worker(session):
                     elif bn == "fix":
                         from skills import self_heal
                         _arg = (payload or "").strip()
-                        if _arg.lower() == "approve" and packet.get("internal"):
-                            _resp = ("Approval has to be typed by an admin - a "
-                                     "scheduled follow-up cannot approve a job.")
-                        elif _arg.lower() == "approve":
-                            _resp = self_heal.approve()
-                        elif _arg.lower() == "reject":
-                            _resp = self_heal.reject()
-                        elif _arg.lower() in ("", "status"):
+                        # "approve", "approve FIX-0003", "reject", "restore FIX-0003".
+                        # The verb is the first word; anything after it is the id.
+                        _parts = _arg.split(None, 1)
+                        _verb  = _parts[0].lower() if _parts else ""
+                        _id    = _parts[1].strip() if len(_parts) > 1 else None
+                        _bare  = _id is None
+                        if _verb in ("approve", "reject", "restore") and packet.get("internal"):
+                            _resp = (f"{_verb.capitalize()} has to be typed by an admin - a "
+                                     "scheduled follow-up cannot decide a job.")
+                        elif _verb == "approve":
+                            _ov = bool(_id) and _id.lower().endswith("override")
+                            _aid = _id[: -len("override")].strip() if _ov else _id
+                            _resp = self_heal.approve(_aid or None, override=_ov)
+                        elif _verb == "reject":
+                            _resp = self_heal.reject(_id)
+                        elif _verb == "restore":
+                            _resp = self_heal.restore(_id)
+                        elif _verb in ("", "status", "list") and _bare:
                             _resp = self_heal.status()
+                        elif _verb in ("status", "show") and re.fullmatch(r"FIX-\d+", _id or "", re.I):
+                            # 'fix: status FIX-0007' used to fall through to the
+                            # new-order branch and stage "status FIX-0007" as a job.
+                            _resp = self_heal.detail(_id)
                         else:
-                            _resp = self_heal.stage(_arg, staged_by=name)
+                            # Anything else is a new work order. "supersedes FIX-0002:"
+                            # at the front retargets it over an existing record.
+                            _sup = _cont = None
+                            _m = re.match(r"^supersedes?\s+(FIX-\d+)\s*[:,]\s*(.+)$",
+                                          _arg, re.I | re.S)
+                            if _m:
+                                _sup, _arg = _m.group(1).upper(), _m.group(2).strip()
+                            _m = re.match(r"^continue\s+(FIX-\d+)\s*[:,]\s*(.+)$",
+                                          _arg, re.I | re.S)
+                            if _m:
+                                _cont, _arg = _m.group(1).upper(), _m.group(2).strip()
+                            try:
+                                _, _resp = self_heal.stage(_arg, staged_by=name,
+                                                           supersedes=_sup,
+                                                           continue_of=_cont)
+                            except Exception as _e:
+                                _resp = f"Could not stage that: {_e}"
                         await send_signal(session, f"{TAGS['chip']} {_resp}",
                                           recipient=sender)
+                        delivered_inline = True
+                        break
+                    elif bn == "build":
+                        # The build track (One Voice spec D.2): a new skill,
+                        # files added only. Typed by an admin; approval is
+                        # still a separate 'fix: approve' — except continuing
+                        # an approved build, which this typed command is.
+                        from skills import self_heal
+                        _arg = (payload or "").strip()
+                        _m = re.match(r"^continue\s+(FIX-\d+)\s*[:,]\s*(.+)$", _arg, re.I | re.S)
+                        try:
+                            if packet.get("internal"):
+                                _resp = "A build has to be typed by an admin."
+                            elif _m:
+                                _cid = _m.group(1).upper()
+                                info, _resp = self_heal.stage(_m.group(2).strip(), staged_by=name,
+                                                              track="build", continue_of=_cid)
+                                _resp = self_heal.approve(info["fix_id"])
+                            else:
+                                _m2 = re.match(r"^([A-Za-z][\w-]{1,40})\s*:\s*(.+)$", _arg, re.S)
+                                if not _m2:
+                                    _resp = "Usage: build: <skill_name>: <what it should do>"
+                                else:
+                                    _, _resp = self_heal.stage(
+                                        _m2.group(2).strip(), staged_by=name, track="build",
+                                        skill_name=_m2.group(1).replace("-", "_"))
+                        except Exception as _e:
+                            _resp = f"Could not stage that: {_e}"
+                        await send_signal(session, f"{TAGS['chip']} {_resp}", recipient=sender)
+                        delivered_inline = True
+                        break
+                    elif bn == "skill":
+                        from skills import skill_loader
+                        _parts = (payload or "").strip().split()
+                        _verb = _parts[0].lower() if _parts else "list"
+                        if _verb in ("off", "disable") and len(_parts) > 1:
+                            _resp = skill_loader.set_enabled(_parts[1], False)
+                        elif _verb in ("on", "enable") and len(_parts) > 1:
+                            _resp = skill_loader.set_enabled(_parts[1], True)
+                        else:
+                            _resp = skill_loader.listing()
+                        await send_signal(session, f"{TAGS['chip']} {_resp}", recipient=sender)
                         delivered_inline = True
                         break
                     elif bn == "effort":
@@ -3791,9 +4398,7 @@ async def worker(session):
                         if expired:
                             _def_tier = USERS.get(sender, {}).get("default_model", "cloud_default")
                             _def_tag   = TAGS.get(_def_tier, TAGS["cloud_default"])
-                            await send_signal(session,
-                                f"{TAGS['chip']} Returning to default model {_def_tag}.",
-                                recipient=sender)
+                            _gate.add_note(f"Back to the default model {_def_tag}.")
                     else:
                         try:
                             answer, tag = await semantic_dispatch(
@@ -3811,8 +4416,32 @@ async def worker(session):
                 final_answer = f"Unknown command '{cmd}'. Try help:"
                 final_tag    = TAGS["chip"]
 
+            # Deferred turn (One Voice spec B.2): this message started workers,
+            # so nothing is sent now. ⏳ stays on the message; the user's turn
+            # goes into history now (so a follow-up message keeps its order);
+            # answer_deferred sends the ONE reply when the workers are done.
+            _dt = _gate.raw()
+            if _dt is not None and _dt.workers:
+                _dt.deferred = True
+                await working()
+                try:
+                    import skills.history as _hist_d
+                    _hist_d.log_turn(name.lower(), "user", text)
+                except Exception as _he:
+                    print(f"⚠️ history (deferred user turn): {_he}")
+                asyncio.create_task(answer_deferred(
+                    session, _dt, "" if delivered_inline else (final_answer or "")))
+                print(f"⏳ turn {_dt.id} deferred on {len(_dt.workers)} worker(s)")
+                final_answer, delivered_inline = None, True
+
             # Deliver
             if final_answer and not delivered_inline:
+                # Fold end-of-turn notices into this reply (see below).
+                _notices_folded = True
+                if decrement_voice(sender):
+                    _gate.add_note("Voice reset to default.")
+                if decrement_effort(sender):
+                    _gate.add_note(f"Thinking effort back to {DEFAULT_EFFORT}.")
                 # File sentinel — send as attachment directly, no length truncation
                 if isinstance(final_answer, str) and final_answer.startswith("__file__"):
                     file_path = final_answer[8:]
@@ -3855,24 +4484,31 @@ async def worker(session):
                         asyncio.create_task(
                             asyncio.to_thread(_hist.maybe_summarize, _tax_name))
 
-            # End-of-turn notices go out as one message, not one each.
-            _notices = []
-            if decrement_voice(sender):
-                _notices.append("Voice reset to default.")
-            if decrement_effort(sender):
-                _notices.append(f"Thinking effort back to {DEFAULT_EFFORT}.")
-            if _notices:
-                await send_signal(session, f"{TAGS['chip']} " + " ".join(_notices),
-                                  recipient=sender)
-            if _reacted:
+            # End-of-turn notices: counted here so the turn counters still
+            # tick, but never sent as a message of their own any more (one in,
+            # one out). They were folded into the reply by _fold_turn_notices
+            # before delivery when there was a reply to fold them into.
+            if not _notices_folded:
+                if decrement_voice(sender):
+                    _gate.add_note("Voice reset to default.")
+                if decrement_effort(sender):
+                    _gate.add_note(f"Thinking effort back to {DEFAULT_EFFORT}.")
+            _t = _gate.raw()
+            if (_reacted or (_t is not None and _t.reacted)) and not (_t and _t.deferred):
                 await send_reaction(sender, ts, "✅")
 
         except Exception as e:
             print(f"⚠️ Worker error: {e}")
             import traceback; traceback.print_exc()
-            if _reacted:
+            _t = _gate.raw()
+            if _reacted or (_t is not None and _t.reacted):
                 await send_reaction(sender, ts, "❌")
-            await send_signal(session, f"{TAGS['chip']} Error: {e}", recipient=sender)
+            # One plain line; the exception itself stays in the log.
+            await send_signal(session,
+                f"{TAGS['chip']} That failed on my end ({type(e).__name__}). "
+                f"It's in the log.", recipient=sender)
+        finally:
+            _gate.end(_gate_tok)
 
         message_queue.task_done()
 
@@ -4021,6 +4657,19 @@ async def reminder_checker(session):
     print("⏰ Reminder checker online.")
     while True:
         await asyncio.sleep(60)
+        # The outbox (One Voice spec A.3): background scripts' events. Urgent
+        # ones go to the admin as ONE message per beat; routine ones wait for
+        # the nightly summary. The heartbeat tells those scripts Chip is
+        # consuming; if it goes stale they send urgent events directly.
+        try:
+            from skills import outbox
+            outbox.beat()
+            _urgent = outbox.drain()
+            if _urgent:
+                await send_signal(session, f"{TAGS['chip']} {outbox.compose(_urgent)}",
+                                  recipient=chip_config.ADMIN_PHONE, kind="alert")
+        except Exception as e:
+            print(f"⚠️ Outbox drain error: {e}")
         try:
             now = datetime.now()
             due = [r for r in load_reminders()
@@ -4046,7 +4695,7 @@ async def reminder_checker(session):
                           f"{r.get('context', '')[:60]}")
                 else:
                     await send_signal(session, r["message"],
-                                      recipient=r["recipient_phone"])
+                                      recipient=r["recipient_phone"], kind="scheduled")
                     print(f"⏰ Fired → {r['recipient_name']}: {r['message'][:60]}")
 
             if due:
@@ -4086,6 +4735,36 @@ async def reminder_checker(session):
         except Exception as e:
             print(f"⚠️ Scheduled job checker error: {e}")
 
+        # Browse stall detection (FIX-0006 phase 7) rides the same 60s beat —
+        # a scheduled check, not a new daemon. Rerouting the terminus only
+        # saves reports that get published; a worker that dies publishes
+        # nothing, and silence has to be impossible. A run whose manifest
+        # heartbeat has stopped advancing is reported through the SAME
+        # machine-origin pipe, so a stall notice reaches the user the same way
+        # a finished run does. Own try block: this must never take the
+        # reminder loop down.
+        try:
+            from skills import browse_capture, workers as _workers
+            for st in browse_capture.find_stalled():
+                # Close the manifest first: if anything below throws, the next
+                # sweep must not report the same stall again.
+                browse_capture.mark_stalled(
+                    st["manifest"], f"stall detected after {st['age_s']}s "
+                                    f"at step {st['last_step']}")
+                # The run belongs to a worker: cancel it, and its result comes
+                # back to Chip as `stalled` with what it recorded. The result
+                # turn tells the user — one reply, never silence, never a dump.
+                if not _workers.cancel_by_run_id(
+                        st["run_id"], f"stall: heartbeat stopped for {st['age_s']}s "
+                                      f"at step {st['last_step']}"):
+                    from skills import worklog as _wl
+                    _wl.log("stall_orphan", run_id=st["run_id"], task=st["task"][:200],
+                            manifest=st["manifest"])
+                print(f"🧟 stalled browse run {st['run_id']} "
+                      f"(step {st['last_step']}, {st['age_s']}s stale)")
+        except Exception as e:
+            print(f"⚠️ Browse stall checker error: {e}")
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def _matrix_refresher():
@@ -4098,6 +4777,95 @@ async def _matrix_refresher():
         except Exception as e:
             print(f"⚠️ Matrix refresh error: {e}")
         await asyncio.sleep(600)
+
+
+async def _ask_answer(ask, text):
+    """Is this inbound message the answer to the pending ask? Code first: a
+    short reply with no question in it is the answer. Anything longer goes to
+    a cheap model for a yes/no. Fails toward 'not the answer' — typing a
+    stray message into a site is worse than a worker waiting a bit longer."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.lower().strip(".!: ") in ("skip", "stop", "cancel", "no"):
+        return True
+    # Only a single alphanumeric token (what a CAPTCHA answer looks like) skips
+    # the classifier; "hows it going" or "stop:" must not be typed into a site.
+    if re.fullmatch(r"[A-Za-z0-9]{2,12}", t):
+        return True
+    try:
+        from skills import llm
+        verdict = await asyncio.to_thread(
+            llm.gemini_sync,
+            f"A browser task paused and asked the user:\n\"{ask.question}\"\n\n"
+            f"The user then sent:\n\"{t[:500]}\"\n\n"
+            "Is the user's message the answer to that question (for example the "
+            "characters shown in a CAPTCHA, or an instruction about that step)? "
+            "Reply with exactly yes or no.", model=llm.GLITE, timeout=20)
+        return verdict.strip().lower().startswith("yes")
+    except Exception as e:
+        print(f"⚠️ ask classification failed ({e}) — treating as not the answer")
+        return False
+
+
+RERUN_WITHIN_S = 1800   # a lost request younger than this is run again, once
+
+
+async def _recover_lost(session, lost_rows):
+    """Work that died with the last process (One Voice spec B.4). A request
+    lost within RERUN_WITHIN_S that has not already been rerun is started
+    again, once, and answered normally; anything else gets one line telling
+    its owner, so a restart is never silent."""
+    from skills import ledger, send_gate, workers
+    await asyncio.sleep(5)                      # let the workers come up
+    by_req = {}
+    for r in lost_rows:
+        by_req.setdefault(r["request_id"], []).append(r)
+    for req, rows in by_req.items():
+        owner, text, ts = rows[0]["owner"], rows[0]["request_text"] or "", rows[0]["inbound_ts"]
+        try:
+            age = (datetime.now() - datetime.fromisoformat(rows[0]["started_at"])).total_seconds()
+        except Exception:
+            age = RERUN_WITHIN_S + 1
+        prior_rerun = any(r.get("rerun_of") for r in ledger.for_request(req))
+        if owner not in USERS:
+            continue
+        if age <= RERUN_WITHIN_S and not prior_rerun:
+            tok = send_gate.begin(owner, ts, text=text)
+            try:
+                t = send_gate.raw()
+                t.request_id = req
+                for r in rows:
+                    workers.launch(session, r["kind"], r["task"] or text, owner=owner,
+                                   rerun_of=r["id"])
+                t.deferred = True
+                asyncio.create_task(answer_deferred(session, t, ""))
+                print(f"🧰 rerunning request {req} after restart ({len(rows)} worker(s))")
+            finally:
+                send_gate.end(tok)
+        else:
+            short = " ".join(text.split())[:80]
+            await send_signal(session,
+                f"{TAGS['chip']} I restarted while working on \"{short}\" and lost it. "
+                f"Send it again if you still want it.", recipient=owner, kind="alert")
+
+
+async def _startup_model_check(session):
+    """Every configured model name, looked up on its own client (One Voice
+    build step 1). Free lookups, off the hot path. A name the client does not
+    know, or a refused key, is a real defect and the admin hears about it once.
+    'Unreachable' is not: the box fails closed when the VPN drops, so that is
+    logged and nothing more. Never allowed to take startup down."""
+    try:
+        from skills import model_check
+        results = await asyncio.to_thread(model_check.check_all)
+        line = model_check.summary_line(results)
+        print(f"🔎 {line}")
+        if model_check.problems(results):
+            await send_signal(session, f"{TAGS['chip']} Startup check failed — {line}",
+                              recipient=chip_config.ADMIN_PHONE, kind="alert")
+    except Exception as e:
+        print(f"⚠️ startup model check skipped: {e}")
 
 
 async def main():
@@ -4128,6 +4896,20 @@ async def main():
         except Exception as e:
             print(f"⚠️ Discord relay skipped: {e}")
 
+        # Work that was running when the last process died died with it
+        # (workers live inside this process). Mark it lost in the ledger so
+        # nothing reports it as still running (One Voice spec B.4).
+        try:
+            from skills import ledger as _ledger
+            _lost = _ledger.mark_lost_on_startup()
+            if _lost:
+                print(f"🧰 {len(_lost)} worker(s) lost to the restart: "
+                      + ", ".join(r["id"] for r in _lost))
+                asyncio.create_task(_recover_lost(session, _lost))
+        except Exception as e:
+            print(f"⚠️ ledger recovery skipped: {e}")
+
+        asyncio.create_task(_startup_model_check(session))
         for _ in range(3):
             asyncio.create_task(worker(session))
         asyncio.create_task(reminder_checker(session))

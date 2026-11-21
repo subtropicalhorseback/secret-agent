@@ -63,6 +63,14 @@ GFLASH = "gemini-3.5-flash"
 GLITE  = "gemini-3.5-flash-lite"
 REFUSAL_FALLBACK = SONNET
 
+# Per-surface model overrides. The browse agent loop (skills/browse.py) runs
+# mechanical navigation steps — click ref N, read, scroll, type — and re-sends
+# its whole transcript every step, so it is the most input-token-hungry surface
+# in the codebase and the least capability-sensitive. It runs on Sonnet; the
+# user-facing finish() deliverable is generated separately on OPUS. Change the
+# loop model HERE, not inside browse.py.
+BROWSE_LOOP_MODEL = SONNET
+
 DEFAULT_EFFORT = "high"    # house default per the admin, 19 Nov 2026
 FABLE_EFFORT   = "xhigh"   # Fable always runs hotter
 MAX_TOKENS     = 16000
@@ -83,13 +91,29 @@ def advisor_tool(max_uses=2, max_tokens=3000):
 # ─── Claude ───────────────────────────────────────────────────────────────────
 
 def claude_raw_sync(messages, system=None, model=OPUS, effort=None,
-                    max_tokens=MAX_TOKENS, tools=None, advisor=False):
+                    max_tokens=MAX_TOKENS, tools=None, advisor=False,
+                    cache=False):
     """Full-control Claude call returning the raw response object.
 
     Handles the per-model parameter quirks and the max-tokens backstop;
     logs usage through call_logger (the single H5 funnel). Callers that just
     want text should use claude_sync/claude below.
+
+    cache=True turns on Anthropic prompt caching for this call: the API places
+    an ephemeral breakpoint on the last cacheable block, which is exactly right
+    for an append-only transcript (every turn re-sends the previous turn's
+    prefix and reads it from cache at ~0.1x). Caching is a PREFIX match — a
+    caller that rewrites earlier turns invalidates everything after the edit,
+    so only set this where history is appended, not mutated.
     """
+    # Client/model mismatch guard (20 Nov 2026). handle_machine_turn passed
+    # "gemini-3.5-flash" here; the API answered 404, the caller swallowed it,
+    # and every browse summary since FIX-0006 silently fell back to a raw
+    # dump. Refuse a non-Claude name before spending a round trip on it.
+    if not str(model).startswith("claude"):
+        raise ValueError(f"claude_raw_sync called with non-Claude model "
+                         f"{model!r} — route it through the matching client")
+
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -115,6 +139,8 @@ def claude_raw_sync(messages, system=None, model=OPUS, effort=None,
         use_beta = True
     if tool_list:
         kw["tools"] = tool_list
+    if cache:
+        kw["cache_control"] = {"type": "ephemeral"}
 
     def _call():
         if use_beta:
@@ -150,7 +176,9 @@ def claude_raw_sync(messages, system=None, model=OPUS, effort=None,
     call_logger.log_model_call(
         model=model, thinking=True,
         tokens_in=resp.usage.input_tokens, tokens_out=resp.usage.output_tokens,
-        stop_reason=resp.stop_reason, tools=tool_names)
+        stop_reason=resp.stop_reason, tools=tool_names,
+        cache_read=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+        cache_write=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0)
     return resp
 
 
@@ -211,3 +239,46 @@ def gemini_sync(prompt, model=GFLASH, system=None, timeout=90, json_mode=False):
 async def gemini(prompt, model=GFLASH, system=None, timeout=90, json_mode=False):
     return await asyncio.to_thread(
         gemini_sync, prompt, model, system, timeout, json_mode)
+
+
+def gemini_vision_sync(prompt, image_path, model=GFLASH, system=None,
+                       timeout=90, json_mode=False):
+    """Same call as gemini_sync, with one image read from disk alongside it.
+
+    Takes a PATH, not bytes: callers (skills/browse_vision.py) reference
+    captures by path precisely so image data never crosses an agent boundary,
+    and reading it here keeps that true right up to the HTTP request.
+    """
+    import base64 as _b64
+    import mimetypes as _mt
+    key = os.environ["GEMINI_API_KEY"]
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={key}")
+    mime = _mt.guess_type(image_path)[0] or "image/png"
+    with open(image_path, "rb") as f:
+        data_b64 = _b64.b64encode(f.read()).decode()
+    payload = {"contents": [{"role": "user", "parts": [
+        {"inline_data": {"mime_type": mime, "data": data_b64}},
+        {"text": prompt},
+    ]}]}
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    if json_mode:
+        payload["generationConfig"] = {"responseMimeType": "application/json"}
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data  = resp.json()
+    usage = data.get("usageMetadata", {})
+    call_logger.log_model_call(
+        model=model, thinking=False,
+        tokens_in=usage.get("promptTokenCount", 0),
+        tokens_out=usage.get("candidatesTokenCount", 0),
+        stop_reason=data["candidates"][0].get("finishReason", "?"), tools=[])
+    parts = data["candidates"][0].get("content", {}).get("parts", [])
+    return "\n".join(p["text"] for p in parts if "text" in p).strip()
+
+
+async def gemini_vision(prompt, image_path, model=GFLASH, system=None,
+                        timeout=90, json_mode=False):
+    return await asyncio.to_thread(
+        gemini_vision_sync, prompt, image_path, model, system, timeout, json_mode)

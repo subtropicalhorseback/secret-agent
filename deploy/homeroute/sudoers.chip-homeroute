@@ -1,0 +1,12 @@
+# Scoped per-task home route for the browse pipeline (home_route.py).
+# Deliberately NO wildcards: every entry is a fixed binary with fixed
+# arguments, and the only rule file is root-owned /etc/chip/homeroute-on.nft.
+# None of these can exec arbitrary code.
+# Template: replace `chip` with the user the coordinator runs as.
+chip ALL=(root) NOPASSWD: /usr/sbin/nft -f /etc/chip/homeroute-on.nft
+chip ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet chip_homeroute
+chip ALL=(root) NOPASSWD: /usr/sbin/nft delete table ip chip_homeroute_nat
+chip ALL=(root) NOPASSWD: /usr/sbin/nft list table inet chip_homeroute
+chip ALL=(root) NOPASSWD: /usr/bin/systemctl restart chip-homeroute-expire.timer
+chip ALL=(root) NOPASSWD: /usr/bin/systemctl stop chip-homeroute-expire.timer
+chip ALL=(root) NOPASSWD: /usr/bin/systemctl is-active chip-homeroute-expire.timer

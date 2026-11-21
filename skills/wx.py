@@ -196,7 +196,7 @@ async def rain_alert_checker(session):
                 msg = (f"🌧️ Rain alert — {DEFAULT_LOCATION}\n"
                        f"Rain probability next few hours: {pct}%")
                 for phone in USERS:
-                    await send_signal(session, msg, recipient=phone)
+                    await send_signal(session, msg, recipient=phone, kind="scheduled")
                     await asyncio.sleep(1)
 
             elif state == "WARNED":
@@ -208,7 +208,7 @@ async def rain_alert_checker(session):
                         rain_state["warned_at"] = now
                         msg = f"🌧️ Rain still likely — {pct}% chance."
                         for phone in USERS:
-                            await send_signal(session, msg, recipient=phone)
+                            await send_signal(session, msg, recipient=phone, kind="scheduled")
                             await asyncio.sleep(1)
                 else:
                     rain_state["state"]    = "CLEAR"

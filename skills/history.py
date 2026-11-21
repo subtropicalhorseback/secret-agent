@@ -53,7 +53,21 @@ def _conn():
 
 
 def log_turn(user, role, content):
-    """Append one turn. Called from coordinator's log path — cheap insert."""
+    """Append one turn. Called from coordinator's log path — cheap insert.
+
+    Machine-origin turns are refused outright (FIX-0006). A browse worker's
+    report is webpage text arriving under a machine principal, and the rolling
+    summary is a record of what a PERSON said. Folding scrape into it would
+    have the model recall page content as if the user had typed it. The guard
+    lives here rather than at the call site so the invariant holds for every
+    caller, present and future — there is no path that can log it by accident.
+    """
+    try:
+        from skills.browse_bus import PRINCIPAL as _MACHINE
+        if str(user or "").lower() == _MACHINE.lower():
+            return
+    except Exception:
+        pass
     try:
         c = _conn()
         c.execute("INSERT INTO turns (user, role, content, ts) VALUES (?,?,?,?)",
@@ -86,7 +100,18 @@ def get_history(user, max_turns=30, max_chars=HISTORY_CHAR_CAP):
     history.reverse()
     while history and history[0]["role"] != "user":
         history.pop(0)
-    return history
+    # Merge consecutive same-role turns. A deferred answer (One Voice spec
+    # B.2) logs the user's message when work starts and Chip's answer when it
+    # ends, so a message sent in between leaves two user turns in a row; the
+    # model APIs want roles to alternate.
+    merged = []
+    for h in history:
+        if merged and merged[-1]["role"] == h["role"]:
+            merged[-1] = {"role": h["role"],
+                          "content": merged[-1]["content"] + "\n\n" + h["content"]}
+        else:
+            merged.append(dict(h))
+    return merged
 
 
 def get_summary(user):

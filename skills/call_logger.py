@@ -87,23 +87,34 @@ def log_route_decision(tier, score, sections):
 
 
 def log_model_call(model, thinking, tokens_in, tokens_out, stop_reason,
-                    tools=None, round_num=1):
+                    tools=None, round_num=1, cache_read=0, cache_write=0):
     """One line per actual API call. For multi-round tool-calling loops,
     call this once per round with the same round_num context incrementing.
 
     Also the single funnel into usage_log.db — every cloud call in the
     codebase already reports here, so cost tracking rides along for free
     rather than needing a log_usage() call bolted onto each site (audit H5).
-    Callers must NOT also call log_usage() or spend double-counts."""
+    Callers must NOT also call log_usage() or spend double-counts.
+
+    cache_read / cache_write are the prompt-caching halves of the input side.
+    tokens_in from the API is the UNCACHED remainder only, so the ledger bills
+    input as tokens_in + 1.25x writes + 0.1x reads — the API's own multipliers,
+    which keeps the dollar figure right without a pricing-table change."""
     tools = tools or []
+    cache_bits = ""
+    if cache_read or cache_write:
+        cache_bits = f" cache_read={cache_read} cache_write={cache_write}"
     logger.info(
         f"{_prefix()} stage=model round={round_num} model={model} "
         f"thinking={'on' if thinking else 'off'} tokens_in={tokens_in} "
-        f"tokens_out={tokens_out} stop_reason={stop_reason} tools={tools}"
+        f"tokens_out={tokens_out}{cache_bits} stop_reason={stop_reason} "
+        f"tools={tools}"
     )
     try:
         from skills.usage_tracker import log_usage
-        log_usage(model, tokens_in or 0, tokens_out or 0, get_trace()[1])
+        billed_in = ((tokens_in or 0) + int((cache_write or 0) * 1.25)
+                     + int((cache_read or 0) * 0.1))
+        log_usage(model, billed_in, tokens_out or 0, get_trace()[1])
     except Exception as e:  # never let cost logging break a live call
         logger.info(f"{_prefix()} stage=usage_log_error err={e}")
 
